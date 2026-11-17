@@ -21,7 +21,7 @@ if not st.session_state.ok:
 
 # --- Collegamento al cervello ---
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-MODEL = "gemini-3.1-flash-lite"
+MODEL = "gemini-3-flash-preview"
 
 ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
