@@ -60,7 +60,6 @@ if prompt:
                     contents=contenuti,
                     config=types.GenerateContentConfig(
                         system_instruction=ISTRUZIONI,
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
                     ),
                 )
                 testo = risposta.text or "Non ho ricevuto risposta."
