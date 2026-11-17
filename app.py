@@ -20,8 +20,8 @@ if not st.session_state.ok:
     st.stop()
 
 # --- Collegamento al cervello ---
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-MODEL = "gemini-3-flash-preview"
+client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"].strip())
+MODEL = "gemini-3.8-flash"
 
 ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
@@ -54,15 +54,18 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Elaboro..."):
-            risposta = client.models.generate_content(
-                model=MODEL,
-                contents=contenuti,
-                config=types.GenerateContentConfig(
-                    system_instruction=ISTRUZIONI,
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                ),
-            )
-            testo = risposta.text or "Non ho ricevuto risposta."
+            try:
+                risposta = client.models.generate_content(
+                    model=MODEL,
+                    contents=contenuti,
+                    config=types.GenerateContentConfig(
+                        system_instruction=ISTRUZIONI,
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                    ),
+                )
+                testo = risposta.text or "Non ho ricevuto risposta."
+            except Exception as e:
+                testo = "ERRORE: " + str(e)[:500]
         st.markdown(testo)
 
     st.session_state.messages.append({"role": "assistant", "text": testo})
