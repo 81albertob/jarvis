@@ -1,6 +1,8 @@
+import datetime
 import streamlit as st
 from google import genai
 from google.genai import types
+from ddgs import DDGS
 
 st.set_page_config(page_title="Jarvis", page_icon="🤖")
 st.title("🤖 J.A.R.V.I.S.")
@@ -23,11 +25,27 @@ if not st.session_state.ok:
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"].strip())
 MODEL = "gemini-3.1-flash-lite"
 
+oggi = datetime.date.today().strftime("%d/%m/%Y")
 ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
     "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
-    "Quando serve, cerca informazioni aggiornate online."
+    f"La data di oggi è {oggi}. "
+    "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
 )
+
+# --- Interruttore ricerca online ---
+usa_web = st.sidebar.checkbox("🔎 Ricerca online", value=True)
+
+
+def cerca_web(domanda):
+    try:
+        risultati = DDGS().text(domanda, region="it-it", max_results=5)
+        return "\n".join(
+            f"- {r['title']}: {r['body']} ({r['href']})" for r in risultati
+        )
+    except Exception:
+        return ""
+
 
 # --- Cronologia della chat ---
 if "messages" not in st.session_state:
@@ -44,13 +62,27 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    contenuti = [
-        types.Content(
-            role="user" if m["role"] == "user" else "model",
-            parts=[types.Part(text=m["text"])],
+    testo_per_ai = prompt
+    if usa_web:
+        with st.spinner("Cerco online..."):
+            info = cerca_web(prompt)
+        if info:
+            testo_per_ai = (
+                prompt
+                + "\n\n[Risultati di ricerca web aggiornati]\n"
+                + info
+            )
+
+    contenuti = []
+    ultimo = len(st.session_state.messages) - 1
+    for i, m in enumerate(st.session_state.messages):
+        testo_msg = testo_per_ai if i == ultimo else m["text"]
+        contenuti.append(
+            types.Content(
+                role="user" if m["role"] == "user" else "model",
+                parts=[types.Part(text=testo_msg)],
+            )
         )
-        for m in st.session_state.messages
-    ]
 
     with st.chat_message("assistant"):
         with st.spinner("Elaboro..."):
