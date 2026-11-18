@@ -1,13 +1,21 @@
 import datetime
 import re
+from zoneinfo import ZoneInfo
+
 import requests
 import streamlit as st
 from google import genai
 from google.genai import types
 from ddgs import DDGS
+from icalendar import Calendar
+import recurring_ical_events
 
 st.set_page_config(page_title="Jarvis", page_icon="🤖")
 st.title("🤖 J.A.R.V.I.S.")
+
+FUSO = ZoneInfo("Europe/Rome")
+MODELLI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+GIORNI = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
 
 # --- Protezione con password ---
 if "ok" not in st.session_state:
@@ -25,7 +33,6 @@ if not st.session_state.ok:
 
 # --- Collegamento al cervello ---
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"].strip())
-MODEL = "gemini-3.1-flash-lite"
 
 # --- Collegamento al database (Supabase) ---
 DB_URL = st.secrets["SUPABASE_URL"].strip().rstrip("/") + "/rest/v1/"
@@ -74,6 +81,45 @@ def salva_chat(ruolo, testo):
             pass
 
 
+# --- Calendario (sola lettura) ---
+@st.cache_data(ttl=300, show_spinner=False)
+def leggi_calendario(url, giorni=14):
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        cal = Calendar.from_ical(r.content)
+        inizio = datetime.datetime.now(FUSO).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        fine = inizio + datetime.timedelta(days=giorni)
+        eventi = recurring_ical_events.of(cal).between(inizio, fine)
+        elenco = []
+        for e in eventi:
+            if str(e.get("STATUS", "")).upper() == "CANCELLED":
+                continue
+            dt = e.get("DTSTART").dt
+            if isinstance(dt, datetime.datetime):
+                if dt.tzinfo:
+                    dt = dt.astimezone(FUSO)
+                quando = dt.strftime("%d/%m/%Y %H:%M")
+                chiave = dt.strftime("%Y-%m-%d %H:%M")
+            else:
+                quando = dt.strftime("%d/%m/%Y") + " (tutto il giorno)"
+                chiave = dt.strftime("%Y-%m-%d") + " 00:00"
+            titolo = str(e.get("SUMMARY", "Senza titolo"))[:80]
+            elenco.append((chiave, quando + " - " + titolo))
+        elenco.sort()
+        return [x[1] for x in elenco[:40]], ""
+    except Exception as ex:
+        return [], str(ex).replace(url, "[indirizzo]")[:200]
+
+
+CAL_URL = str(st.secrets.get("CALENDAR_URL", "")).strip()
+if CAL_URL:
+    eventi_cal, errore_cal = leggi_calendario(CAL_URL)
+else:
+    eventi_cal, errore_cal = [], "non configurato"
+
 # --- Primo caricamento: memoria e cronologia ---
 if "db_ok" not in st.session_state:
     try:
@@ -96,6 +142,13 @@ if st.session_state.db_ok:
 else:
     st.sidebar.error("Memoria NON collegata: " + st.session_state.db_errore)
 
+if CAL_URL and not errore_cal:
+    st.sidebar.success("📅 Calendario collegato (" + str(len(eventi_cal)) + " eventi)")
+elif CAL_URL:
+    st.sidebar.error("Calendario NON collegato: " + errore_cal)
+else:
+    st.sidebar.info("📅 Calendario non configurato")
+
 with st.sidebar.expander("Cosa ricordo di te"):
     if not st.session_state.memorie:
         st.write("Ancora niente. Scrivi: ricorda che ...")
@@ -116,12 +169,13 @@ if st.sidebar.button("Cancella cronologia chat"):
     st.session_state.messages = []
     st.rerun()
 
-# --- Istruzioni per Jarvis (con le cose che ricorda) ---
-oggi = datetime.date.today().strftime("%d/%m/%Y")
+# --- Istruzioni per Jarvis ---
+adesso = datetime.datetime.now(FUSO)
+oggi = GIORNI[adesso.weekday()] + " " + adesso.strftime("%d/%m/%Y %H:%M")
 ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
     "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
-    f"La data di oggi è {oggi}. "
+    f"Data e ora attuali (Italia): {oggi}. "
     "Non dire mai di aver salvato o annotato qualcosa: lo fa un comando a parte. "
     "Dai del tu all'utente. "
     "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
@@ -130,6 +184,14 @@ if st.session_state.memorie:
     ISTRUZIONI += "\n\nCose che sai sull'utente (memoria permanente):\n" + "\n".join(
         "- " + m["testo"] for m in st.session_state.memorie
     )
+if CAL_URL and not errore_cal:
+    if eventi_cal:
+        ISTRUZIONI += (
+            "\n\nAppuntamenti dell'utente nei prossimi 14 giorni (dal suo calendario):\n"
+            + "\n".join("- " + x for x in eventi_cal)
+        )
+    else:
+        ISTRUZIONI += "\n\nL'utente non ha appuntamenti nei prossimi 14 giorni."
 
 
 def cerca_web(domanda):
@@ -172,14 +234,15 @@ if prompt:
                 testo = "ERRORE nel salvare: " + str(e)[:300]
         else:
             testo = "Cosa devo ricordare? Scrivi ad esempio: ricorda che ..."
-        with st.chat_message("assistant"):
-            st.markdown(testo)
         st.session_state.messages.append({"role": "assistant", "text": testo})
         salva_chat("assistant", testo)
-        st.stop()
+        st.rerun()
 
+    # Ricerca web (non serve per domande sul calendario)
+    parole_calendario = ("appuntament", "calendario", "agenda", "impegn")
+    parla_di_calendario = any(p in prompt.lower() for p in parole_calendario)
     testo_per_ai = prompt
-    if usa_web:
+    if usa_web and not parla_di_calendario:
         with st.spinner("Cerco online..."):
             info = cerca_web(prompt)
         if info:
@@ -200,17 +263,27 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Elaboro..."):
-            try:
-                risposta = client.models.generate_content(
-                    model=MODEL,
-                    contents=contenuti,
-                    config=types.GenerateContentConfig(
-                        system_instruction=ISTRUZIONI,
-                    ),
-                )
-                testo = risposta.text or "Non ho ricevuto risposta."
-            except Exception as e:
-                testo = "ERRORE: " + str(e)[:500]
+            testo = None
+            ultimo_errore = ""
+            for nome_modello in MODELLI:
+                try:
+                    risposta = client.models.generate_content(
+                        model=nome_modello,
+                        contents=contenuti,
+                        config=types.GenerateContentConfig(
+                            system_instruction=ISTRUZIONI,
+                        ),
+                    )
+                    testo = risposta.text
+                    if testo:
+                        break
+                except Exception as e:
+                    ultimo_errore = str(e)[:300]
+            if not testo:
+                if ultimo_errore:
+                    testo = "ERRORE: " + ultimo_errore
+                else:
+                    testo = "Non ho ricevuto risposta."
         st.markdown(testo)
 
     st.session_state.messages.append({"role": "assistant", "text": testo})
