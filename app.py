@@ -32,7 +32,7 @@ h1 {
 """,
     unsafe_allow_html=True,
 )
-st.title("J.A.R.V.I.S.")
+st.title("JARVIS 1.0")
 st.caption("Just A Rather Very Intelligent System")
 
 FUSO = ZoneInfo("Europe/Rome")
