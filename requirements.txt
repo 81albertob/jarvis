@@ -1,3 +1,6 @@
 streamlit
 google-genai
 ddgs
+requests
+icalendar
+recurring-ical-events
