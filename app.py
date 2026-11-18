@@ -89,4 +89,129 @@ if "db_ok" not in st.session_state:
 
 # --- Menu laterale ---
 st.sidebar.header("Jarvis")
-usa_web =
+usa_web = st.sidebar.checkbox("🔎 Ricerca online", value=True)
+
+if st.session_state.db_ok:
+    st.sidebar.success("🧠 Memoria collegata")
+else:
+    st.sidebar.error("Memoria NON collegata: " + st.session_state.db_errore)
+
+with st.sidebar.expander("Cosa ricordo di te"):
+    if not st.session_state.memorie:
+        st.write("Ancora niente. Scrivi: ricorda che ...")
+    for mem in st.session_state.memorie:
+        if st.button("🗑 " + mem["testo"][:40], key="del" + str(mem["id"])):
+            try:
+                db_cancella("memorie", {"id": "eq." + str(mem["id"])})
+                st.session_state.memorie = carica_memorie()
+            except Exception:
+                pass
+            st.rerun()
+
+if st.sidebar.button("Cancella cronologia chat"):
+    try:
+        db_cancella("chat", {"id": "gt.0"})
+    except Exception:
+        pass
+    st.session_state.messages = []
+    st.rerun()
+
+# --- Istruzioni per Jarvis (con le cose che ricorda) ---
+oggi = datetime.date.today().strftime("%d/%m/%Y")
+ISTRUZIONI = (
+    "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
+    "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
+    f"La data di oggi è {oggi}. "
+    "Non dire mai di aver salvato o annotato qualcosa: lo fa un comando a parte. "
+    "Dai del tu all'utente. "
+    "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
+)
+if st.session_state.memorie:
+    ISTRUZIONI += "\n\nCose che sai sull'utente (memoria permanente):\n" + "\n".join(
+        "- " + m["testo"] for m in st.session_state.memorie
+    )
+
+
+def cerca_web(domanda):
+    try:
+        risultati = DDGS().text(domanda, region="it-it", max_results=5)
+        return "\n".join(
+            f"- {r['title']}: {r['body']} ({r['href']})" for r in risultati
+        )
+    except Exception:
+        return ""
+
+
+# --- Mostra la chat ---
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["text"])
+
+prompt = st.chat_input("Parla con Jarvis...")
+
+if prompt:
+    st.session_state.messages.append({"role": "user", "text": prompt})
+    salva_chat("user", prompt)
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Comando "ricorda ..." (anche in mezzo alla frase)
+    trovato = re.search(r"\bricord(a|ati)\b", prompt, flags=re.IGNORECASE)
+    if trovato:
+        fatto = prompt[trovato.end():].strip(" :,-")
+        for p in ("ti ", "mi ", "che ", "di "):
+            if fatto.lower().startswith(p):
+                fatto = fatto[len(p):]
+        fatto = fatto.strip(" :,-")
+        if fatto and st.session_state.db_ok:
+            try:
+                db_scrivi("memorie", {"testo": fatto})
+                st.session_state.memorie = carica_memorie()
+                testo = "Annotato: " + fatto
+            except Exception as e:
+                testo = "ERRORE nel salvare: " + str(e)[:300]
+        else:
+            testo = "Cosa devo ricordare? Scrivi ad esempio: ricorda che ..."
+        with st.chat_message("assistant"):
+            st.markdown(testo)
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.stop()
+
+    testo_per_ai = prompt
+    if usa_web:
+        with st.spinner("Cerco online..."):
+            info = cerca_web(prompt)
+        if info:
+            testo_per_ai = (
+                prompt + "\n\n[Risultati di ricerca web aggiornati]\n" + info
+            )
+
+    contenuti = []
+    ultimo = len(st.session_state.messages) - 1
+    for i, m in enumerate(st.session_state.messages):
+        testo_msg = testo_per_ai if i == ultimo else m["text"]
+        contenuti.append(
+            types.Content(
+                role="user" if m["role"] == "user" else "model",
+                parts=[types.Part(text=testo_msg)],
+            )
+        )
+
+    with st.chat_message("assistant"):
+        with st.spinner("Elaboro..."):
+            try:
+                risposta = client.models.generate_content(
+                    model=MODEL,
+                    contents=contenuti,
+                    config=types.GenerateContentConfig(
+                        system_instruction=ISTRUZIONI,
+                    ),
+                )
+                testo = risposta.text or "Non ho ricevuto risposta."
+            except Exception as e:
+                testo = "ERRORE: " + str(e)[:500]
+        st.markdown(testo)
+
+    st.session_state.messages.append({"role": "assistant", "text": testo})
+    salva_chat("assistant", testo)
