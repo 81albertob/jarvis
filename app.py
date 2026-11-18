@@ -11,7 +11,29 @@ from icalendar import Calendar
 import recurring_ical_events
 
 st.set_page_config(page_title="Jarvis", page_icon="🤖")
-st.title("🤖 J.A.R.V.I.S.")
+st.markdown(
+    """
+<style>
+h1 {
+    color: #00d4ff;
+    letter-spacing: 0.35em;
+    text-align: center;
+    text-shadow: 0 0 14px #00d4ff;
+}
+[data-testid="stChatMessage"] {
+    border: 1px solid #12405a;
+    border-radius: 12px;
+    background: rgba(0, 212, 255, 0.05);
+}
+[data-testid="stSidebar"] {
+    border-right: 1px solid #12405a;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+st.title("J.A.R.V.I.S.")
+st.caption("Just A Rather Very Intelligent System")
 
 FUSO = ZoneInfo("Europe/Rome")
 MODELLI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
