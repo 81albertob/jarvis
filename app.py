@@ -107,7 +107,11 @@ def salva_chat(ruolo, testo):
             pass
 
 
-# --- Calendari (sola lettura): un evento di più giorni = una riga sola ---
+# --- Calendari (sola lettura) ---
+def data_it(d):
+    return GIORNI[d.weekday()] + " " + d.strftime("%d/%m/%Y")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def leggi_calendario(url, etichetta, giorni=14):
     try:
@@ -118,7 +122,7 @@ def leggi_calendario(url, etichetta, giorni=14):
         inizio = datetime.datetime.combine(oggi_d, datetime.time.min, tzinfo=FUSO)
         fine = inizio + datetime.timedelta(days=giorni)
         eventi = recurring_ical_events.of(cal).between(inizio, fine)
-        elenco = []
+        singoli = []
         for e in eventi:
             if str(e.get("STATUS", "")).upper() == "CANCELLED":
                 continue
@@ -156,22 +160,55 @@ def leggi_calendario(url, etichetta, giorni=14):
                         g_fine -= datetime.timedelta(days=1)
             if g_fine < g_inizio:
                 g_fine = g_inizio
-            totale = (g_fine - g_inizio).days + 1
+            singoli.append(
+                {
+                    "titolo": titolo,
+                    "g1": g_inizio,
+                    "g2": g_fine,
+                    "tutto": tutto_giorno,
+                    "ora": ora,
+                }
+            )
+
+        # Unisce gli eventi "tutto il giorno" con lo stesso titolo che si susseguono
+        singoli.sort(
+            key=lambda x: (x["titolo"].lower(), not x["tutto"], x["g1"], x["ora"])
+        )
+        uniti = []
+        for ev in singoli:
+            if (
+                uniti
+                and ev["tutto"]
+                and uniti[-1]["tutto"]
+                and uniti[-1]["titolo"].lower() == ev["titolo"].lower()
+                and ev["g1"] <= uniti[-1]["g2"] + datetime.timedelta(days=1)
+            ):
+                if ev["g2"] > uniti[-1]["g2"]:
+                    uniti[-1]["g2"] = ev["g2"]
+            else:
+                uniti.append(dict(ev))
+
+        elenco = []
+        for ev in uniti:
+            g1 = ev["g1"]
+            g2 = ev["g2"]
+            totale = (g2 - g1).days + 1
             if totale > 1:
-                tipo = "tutto il giorno" if tutto_giorno else "dalle " + ora
+                tipo = "tutto il giorno" if ev["tutto"] else "dalle " + ev["ora"]
                 quando = (
-                    "dal " + g_inizio.strftime("%d/%m/%Y")
-                    + " al " + g_fine.strftime("%d/%m/%Y")
+                    "da " + data_it(g1) + " a " + data_it(g2)
                     + " (" + str(totale) + " giorni consecutivi, " + tipo + ")"
                 )
-                chiave = max(g_inizio, oggi_d).strftime("%Y-%m-%d") + " 00:00"
-            elif tutto_giorno:
-                quando = g_inizio.strftime("%d/%m/%Y") + " (tutto il giorno)"
-                chiave = g_inizio.strftime("%Y-%m-%d") + " 00:00"
+                chiave = max(g1, oggi_d).strftime("%Y-%m-%d") + " 00:00"
+            elif ev["tutto"]:
+                quando = data_it(g1) + " (tutto il giorno)"
+                chiave = g1.strftime("%Y-%m-%d") + " 00:00"
             else:
-                quando = g_inizio.strftime("%d/%m/%Y") + " " + ora
-                chiave = g_inizio.strftime("%Y-%m-%d") + " " + ora
-            elenco.append((chiave, quando + " - " + titolo + " [" + etichetta + "]"))
+                quando = data_it(g1) + " " + ev["ora"]
+                chiave = g1.strftime("%Y-%m-%d") + " " + ev["ora"]
+            elenco.append(
+                (chiave, quando + " - " + ev["titolo"] + " [" + etichetta + "]")
+            )
         return elenco, ""
     except Exception as ex:
         return [], str(ex).replace(url, "[indirizzo]")[:200]
@@ -340,12 +377,14 @@ if calendari_ok:
     if eventi_cal:
         ISTRUZIONI += (
             "\n\nAppuntamenti dell'utente nei prossimi 14 giorni. "
+            "I giorni della settimana sono già scritti nelle date: usali così "
+            "come sono, non ricalcolarli. "
             "Un evento di più giorni compare in UNA sola riga, con scritto "
-            "'dal ... al ... (N giorni consecutivi)': vale per tutti i giorni "
-            "compresi tra le due date. Quando lo riassumi dì sempre che è "
-            "continuo, da che giorno a che giorno, e se l'utente chiede di un "
-            "singolo giorno controlla se rientra in uno di questi intervalli. "
-            "Tra parentesi quadre c'è il nome del calendario:\n"
+            "'da ... a ... (N giorni consecutivi)': vale per tutti i giorni "
+            "compresi tra le due date, estremi inclusi. Quando lo riassumi dì "
+            "sempre che è continuo, da che giorno a che giorno, e se l'utente "
+            "chiede di un singolo giorno controlla se rientra in uno di questi "
+            "intervalli. Tra parentesi quadre c'è il nome del calendario:\n"
             + "\n".join("- " + x for x in eventi_cal)
         )
     else:
