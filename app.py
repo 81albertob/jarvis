@@ -1,5 +1,9 @@
 import datetime
+import email
+import imaplib
 import re
+from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -32,7 +36,7 @@ h1 {
 """,
     unsafe_allow_html=True,
 )
-st.title("JARVIS 1.0")
+st.title("J.A.R.V.I.S.")
 st.caption("Just A Rather Very Intelligent System")
 
 FUSO = ZoneInfo("Europe/Rome")
@@ -103,33 +107,67 @@ def salva_chat(ruolo, testo):
             pass
 
 
-# --- Calendari (sola lettura, anche più di uno) ---
+# --- Calendari (sola lettura, anche più di uno, eventi di più giorni) ---
 @st.cache_data(ttl=300, show_spinner=False)
 def leggi_calendario(url, etichetta, giorni=14):
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         cal = Calendar.from_ical(r.content)
-        inizio = datetime.datetime.now(FUSO).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        oggi_d = datetime.datetime.now(FUSO).date()
+        inizio = datetime.datetime.combine(oggi_d, datetime.time.min, tzinfo=FUSO)
         fine = inizio + datetime.timedelta(days=giorni)
+        ultimo_giorno = fine.date() - datetime.timedelta(days=1)
         eventi = recurring_ical_events.of(cal).between(inizio, fine)
         elenco = []
         for e in eventi:
             if str(e.get("STATUS", "")).upper() == "CANCELLED":
                 continue
-            dt = e.get("DTSTART").dt
-            if isinstance(dt, datetime.datetime):
-                if dt.tzinfo:
-                    dt = dt.astimezone(FUSO)
-                quando = dt.strftime("%d/%m/%Y %H:%M")
-                chiave = dt.strftime("%Y-%m-%d %H:%M")
-            else:
-                quando = dt.strftime("%d/%m/%Y") + " (tutto il giorno)"
-                chiave = dt.strftime("%Y-%m-%d") + " 00:00"
             titolo = str(e.get("SUMMARY", "Senza titolo"))[:80]
-            elenco.append((chiave, quando + " - " + titolo + " [" + etichetta + "]"))
+            dt_inizio = e.get("DTSTART").dt
+            dt_fine = e.get("DTEND").dt if e.get("DTEND") else None
+            tutto_giorno = not isinstance(dt_inizio, datetime.datetime)
+            if tutto_giorno:
+                g_inizio = dt_inizio
+                if dt_fine:
+                    g_fine = dt_fine - datetime.timedelta(days=1)
+                else:
+                    g_fine = dt_inizio
+                ora = ""
+            else:
+                if dt_inizio.tzinfo:
+                    dt_inizio = dt_inizio.astimezone(FUSO)
+                g_inizio = dt_inizio.date()
+                ora = dt_inizio.strftime("%H:%M")
+                g_fine = g_inizio
+                if isinstance(dt_fine, datetime.datetime):
+                    if dt_fine.tzinfo:
+                        dt_fine = dt_fine.astimezone(FUSO)
+                    g_fine = dt_fine.date()
+                    if dt_fine.time() == datetime.time(0, 0) and g_fine > g_inizio:
+                        g_fine -= datetime.timedelta(days=1)
+            if g_fine < g_inizio:
+                g_fine = g_inizio
+            totale = (g_fine - g_inizio).days + 1
+            g = max(g_inizio, oggi_d)
+            while g <= min(g_fine, ultimo_giorno):
+                numero = (g - g_inizio).days + 1
+                if tutto_giorno:
+                    quando = g.strftime("%d/%m/%Y") + " (tutto il giorno)"
+                    chiave = g.strftime("%Y-%m-%d") + " 00:00"
+                elif g == g_inizio:
+                    quando = g.strftime("%d/%m/%Y") + " " + ora
+                    chiave = g.strftime("%Y-%m-%d") + " " + ora
+                else:
+                    quando = g.strftime("%d/%m/%Y") + " (in corso)"
+                    chiave = g.strftime("%Y-%m-%d") + " 00:00"
+                nota = ""
+                if totale > 1:
+                    nota = " (giorno " + str(numero) + " di " + str(totale) + ")"
+                elenco.append(
+                    (chiave, quando + " - " + titolo + nota + " [" + etichetta + "]")
+                )
+                g += datetime.timedelta(days=1)
         return elenco, ""
     except Exception as ex:
         return [], str(ex).replace(url, "[indirizzo]")[:200]
@@ -154,8 +192,66 @@ for etichetta_cal, url_cal in CALENDARI:
     stato_calendari.append((etichetta_cal, len(righe_cal), errore_cal))
     tutti_eventi.extend(righe_cal)
 tutti_eventi.sort()
-eventi_cal = [x[1] for x in tutti_eventi[:60]]
+eventi_cal = [x[1] for x in tutti_eventi[:100]]
 calendari_ok = [s for s in stato_calendari if not s[2]]
+
+
+# --- Gmail (sola lettura: solo mittente, data e oggetto) ---
+@st.cache_data(ttl=300, show_spinner=False)
+def leggi_posta(indirizzo, password, quante=20):
+    m = None
+    try:
+        m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        m.login(indirizzo, password)
+        m.select("INBOX", readonly=True)
+        _, dati_nl = m.search(None, "UNSEEN")
+        non_lette = len(dati_nl[0].split())
+        _, dati = m.search(None, "ALL")
+        ids = dati[0].split()[-quante:]
+        elenco = []
+        for num in reversed(ids):
+            try:
+                _, msg = m.fetch(
+                    num, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])"
+                )
+                intest = email.message_from_bytes(msg[0][1])
+                letta = b"\\Seen" in msg[0][0]
+                mittente = str(make_header(decode_header(intest.get("From", ""))))[:60]
+                oggetto = str(
+                    make_header(decode_header(intest.get("Subject", "(nessun oggetto)")))
+                )[:100]
+                try:
+                    quando = (
+                        parsedate_to_datetime(intest.get("Date"))
+                        .astimezone(FUSO)
+                        .strftime("%d/%m/%Y %H:%M")
+                    )
+                except Exception:
+                    quando = "data sconosciuta"
+                stato = "" if letta else " [NON LETTA]"
+                elenco.append(
+                    quando + " | da " + mittente + " | " + oggetto + stato
+                )
+            except Exception:
+                continue
+        return elenco, non_lette, ""
+    except Exception as ex:
+        return [], 0, str(ex).replace(password, "[password]")[:200]
+    finally:
+        if m is not None:
+            try:
+                m.logout()
+            except Exception:
+                pass
+
+
+GMAIL_INDIRIZZO = str(st.secrets.get("GMAIL_ADDRESS", "")).strip()
+GMAIL_PASSWORD = str(st.secrets.get("GMAIL_APP_PASSWORD", "")).replace(" ", "").strip()
+if GMAIL_INDIRIZZO and GMAIL_PASSWORD:
+    email_recenti, non_lette, errore_posta = leggi_posta(GMAIL_INDIRIZZO, GMAIL_PASSWORD)
+else:
+    email_recenti, non_lette, errore_posta = [], 0, "non configurato"
+posta_ok = bool(GMAIL_INDIRIZZO and GMAIL_PASSWORD) and not errore_posta
 # --- Primo caricamento: memoria e cronologia ---
 if "db_ok" not in st.session_state:
     try:
@@ -184,7 +280,14 @@ for nome, quanti, errore in stato_calendari:
     if errore:
         st.sidebar.error("📅 " + nome + " NON collegato: " + errore)
     else:
-        st.sidebar.success("📅 " + nome + " (" + str(quanti) + " eventi)")
+        st.sidebar.success("📅 " + nome + " (" + str(quanti) + " giorni-evento)")
+
+if not (GMAIL_INDIRIZZO and GMAIL_PASSWORD):
+    st.sidebar.info("✉️ Gmail non configurato")
+elif errore_posta:
+    st.sidebar.error("✉️ Gmail NON collegato: " + errore_posta)
+else:
+    st.sidebar.success("✉️ Gmail (" + str(non_lette) + " non lette)")
 
 with st.sidebar.expander("Cosa ricordo di te"):
     if not st.session_state.memorie:
@@ -225,11 +328,20 @@ if calendari_ok:
     if eventi_cal:
         ISTRUZIONI += (
             "\n\nAppuntamenti dell'utente nei prossimi 14 giorni. "
+            "Gli eventi di più giorni compaiono una volta per ogni giorno, "
+            "con scritto 'giorno N di M'. "
             "Tra parentesi quadre c'è il nome del calendario:\n"
             + "\n".join("- " + x for x in eventi_cal)
         )
     else:
         ISTRUZIONI += "\n\nL'utente non ha appuntamenti nei prossimi 14 giorni."
+if posta_ok:
+    ISTRUZIONI += (
+        "\n\nPosta in arrivo dell'utente (Gmail, sola lettura). Le email non lette "
+        "sono " + str(non_lette) + ". Ecco le ultime, dalla più recente. "
+        "Conosci solo mittente, data e oggetto, non il testo:\n"
+        + "\n".join("- " + x for x in email_recenti)
+    )
 
 
 def cerca_web(domanda):
@@ -276,11 +388,13 @@ if prompt:
         salva_chat("assistant", testo)
         st.rerun()
 
-    # Ricerca web (non serve per domande sul calendario)
-    parole_calendario = ("appuntament", "calendario", "agenda", "impegn")
-    parla_di_calendario = any(p in prompt.lower() for p in parole_calendario)
+    # Ricerca web (non serve per domande su calendario o posta)
+    parole_interne = (
+        "appuntament", "calendario", "agenda", "impegn", "mail", "posta", "messaggi",
+    )
+    parla_di_cose_tue = any(p in prompt.lower() for p in parole_interne)
     testo_per_ai = prompt
-    if usa_web and not parla_di_calendario:
+    if usa_web and not parla_di_cose_tue:
         with st.spinner("Cerco online..."):
             info = cerca_web(prompt)
         if info:
