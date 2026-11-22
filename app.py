@@ -107,7 +107,7 @@ def salva_chat(ruolo, testo):
             pass
 
 
-# --- Calendari (sola lettura, anche più di uno, eventi di più giorni) ---
+# --- Calendari (sola lettura): un evento di più giorni = una riga sola ---
 @st.cache_data(ttl=300, show_spinner=False)
 def leggi_calendario(url, etichetta, giorni=14):
     try:
@@ -117,7 +117,6 @@ def leggi_calendario(url, etichetta, giorni=14):
         oggi_d = datetime.datetime.now(FUSO).date()
         inizio = datetime.datetime.combine(oggi_d, datetime.time.min, tzinfo=FUSO)
         fine = inizio + datetime.timedelta(days=giorni)
-        ultimo_giorno = fine.date() - datetime.timedelta(days=1)
         eventi = recurring_ical_events.of(cal).between(inizio, fine)
         elenco = []
         for e in eventi:
@@ -158,25 +157,21 @@ def leggi_calendario(url, etichetta, giorni=14):
             if g_fine < g_inizio:
                 g_fine = g_inizio
             totale = (g_fine - g_inizio).days + 1
-            g = max(g_inizio, oggi_d)
-            while g <= min(g_fine, ultimo_giorno):
-                numero = (g - g_inizio).days + 1
-                if tutto_giorno:
-                    quando = g.strftime("%d/%m/%Y") + " (tutto il giorno)"
-                    chiave = g.strftime("%Y-%m-%d") + " 00:00"
-                elif g == g_inizio:
-                    quando = g.strftime("%d/%m/%Y") + " " + ora
-                    chiave = g.strftime("%Y-%m-%d") + " " + ora
-                else:
-                    quando = g.strftime("%d/%m/%Y") + " (in corso)"
-                    chiave = g.strftime("%Y-%m-%d") + " 00:00"
-                nota = ""
-                if totale > 1:
-                    nota = " (giorno " + str(numero) + " di " + str(totale) + ")"
-                elenco.append(
-                    (chiave, quando + " - " + titolo + nota + " [" + etichetta + "]")
+            if totale > 1:
+                tipo = "tutto il giorno" if tutto_giorno else "dalle " + ora
+                quando = (
+                    "dal " + g_inizio.strftime("%d/%m/%Y")
+                    + " al " + g_fine.strftime("%d/%m/%Y")
+                    + " (" + str(totale) + " giorni consecutivi, " + tipo + ")"
                 )
-                g += datetime.timedelta(days=1)
+                chiave = max(g_inizio, oggi_d).strftime("%Y-%m-%d") + " 00:00"
+            elif tutto_giorno:
+                quando = g_inizio.strftime("%d/%m/%Y") + " (tutto il giorno)"
+                chiave = g_inizio.strftime("%Y-%m-%d") + " 00:00"
+            else:
+                quando = g_inizio.strftime("%d/%m/%Y") + " " + ora
+                chiave = g_inizio.strftime("%Y-%m-%d") + " " + ora
+            elenco.append((chiave, quando + " - " + titolo + " [" + etichetta + "]"))
         return elenco, ""
     except Exception as ex:
         return [], str(ex).replace(url, "[indirizzo]")[:200]
@@ -289,7 +284,7 @@ for nome, quanti, errore in stato_calendari:
     if errore:
         st.sidebar.error("📅 " + nome + " NON collegato: " + errore)
     else:
-        st.sidebar.success("📅 " + nome + " (" + str(quanti) + " giorni-evento)")
+        st.sidebar.success("📅 " + nome + " (" + str(quanti) + " eventi)")
 
 with st.sidebar.expander("Cosa vedo nei calendari"):
     if not eventi_cal:
@@ -333,6 +328,8 @@ ISTRUZIONI = (
     f"Data e ora attuali (Italia): {oggi}. "
     "Non dire mai di aver salvato o annotato qualcosa: lo fa un comando a parte. "
     "Dai del tu all'utente. "
+    "Non inventare mai persone, luoghi o dettagli che non sono nei dati che ti "
+    "vengono forniti: se non sai una cosa, dillo. "
     "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
 )
 if st.session_state.memorie:
@@ -343,9 +340,11 @@ if calendari_ok:
     if eventi_cal:
         ISTRUZIONI += (
             "\n\nAppuntamenti dell'utente nei prossimi 14 giorni. "
-            "Gli eventi di più giorni compaiono una volta per ogni giorno, "
-            "con scritto 'giorno N di M': raggruppali e dì da che giorno a che "
-            "giorno durano. "
+            "Un evento di più giorni compare in UNA sola riga, con scritto "
+            "'dal ... al ... (N giorni consecutivi)': vale per tutti i giorni "
+            "compresi tra le due date. Quando lo riassumi dì sempre che è "
+            "continuo, da che giorno a che giorno, e se l'utente chiede di un "
+            "singolo giorno controlla se rientra in uno di questi intervalli. "
             "Tra parentesi quadre c'è il nome del calendario:\n"
             + "\n".join("- " + x for x in eventi_cal)
         )
