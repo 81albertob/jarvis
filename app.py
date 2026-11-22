@@ -236,8 +236,56 @@ tutti_eventi.sort()
 eventi_cal = [x[1] for x in tutti_eventi[:100]]
 calendari_ok = [s for s in stato_calendari if not s[2]]
 
+# --- Regole per la posta ---
+# Mittenti commerciali: di queste email Jarvis riceve SOLO il mittente.
+# Per aggiungerne uno, scrivi il nome tra virgolette e aggiungi una virgola.
+MITTENTI_COMMERCIALI = [
+    r"calzedonia",
+    r"tommy\s*hilfiger",
+    r"zalando",
+    r"amazon",
+    r"\bzara\b",
+    r"decathlon",
+    r"esselunga",
+]
+# Per Amazon: se l'oggetto contiene una di queste parole è una notifica
+# di spedizione/consegna e viene letta normalmente.
+PAROLE_PACCO = [
+    "consegn", "spedi", "in arrivo", "pacco", "arrivo", "recapit",
+    "ritiro", "tracking", "tracciamento", "delivered", "shipped",
+    "dispatched", "out for delivery",
+]
 
-# --- Gmail (sola lettura: solo mittente, data e oggetto) ---
+
+def e_commerciale(mittente, oggetto):
+    m = mittente.lower()
+    if not any(re.search(p, m) for p in MITTENTI_COMMERCIALI):
+        return False
+    if "amazon" in m:
+        o = oggetto.lower()
+        if any(p in o for p in PAROLE_PACCO):
+            return False
+    return True
+
+
+def conta_allegati(m, num):
+    # Legge solo la struttura della mail: non scarica né apre gli allegati.
+    try:
+        _, r = m.fetch(num, "(BODYSTRUCTURE)")
+        blocco = b""
+        for el in r:
+            if isinstance(el, tuple):
+                for parte in el:
+                    if isinstance(parte, bytes):
+                        blocco += parte
+            elif isinstance(el, bytes):
+                blocco += el
+        return blocco.upper().count(b'"ATTACHMENT"')
+    except Exception:
+        return 0
+
+
+# --- Gmail (sola lettura: mittente, data, oggetto, presenza di allegati) ---
 @st.cache_data(ttl=300, show_spinner=False)
 def leggi_posta(indirizzo, password, quante=20):
     m = None
@@ -261,6 +309,12 @@ def leggi_posta(indirizzo, password, quante=20):
                 oggetto = str(
                     make_header(decode_header(intest.get("Subject", "(nessun oggetto)")))
                 )[:100]
+                if e_commerciale(mittente, oggetto):
+                    elenco.append(
+                        "da " + mittente + " | email commerciale "
+                        "(oggetto e data omessi)"
+                    )
+                    continue
                 try:
                     quando = (
                         parsedate_to_datetime(intest.get("Date"))
@@ -270,8 +324,16 @@ def leggi_posta(indirizzo, password, quante=20):
                 except Exception:
                     quando = "data sconosciuta"
                 stato = "" if letta else " [NON LETTA]"
+                allegati = conta_allegati(m, num)
+                nota = ""
+                if allegati:
+                    nota = (
+                        " [📎 " + str(allegati)
+                        + (" allegato" if allegati == 1 else " allegati")
+                        + " - NON aperti]"
+                    )
                 elenco.append(
-                    quando + " | da " + mittente + " | " + oggetto + stato
+                    quando + " | da " + mittente + " | " + oggetto + stato + nota
                 )
             except Exception:
                 continue
@@ -335,6 +397,9 @@ elif errore_posta:
     st.sidebar.error("✉️ Gmail NON collegato: " + errore_posta)
 else:
     st.sidebar.success("✉️ Gmail (" + str(non_lette) + " non lette)")
+    with st.sidebar.expander("Cosa vedo nelle email"):
+        for riga in email_recenti:
+            st.write("• " + riga)
 
 with st.sidebar.expander("Cosa ricordo di te"):
     if not st.session_state.memorie:
@@ -393,7 +458,11 @@ if posta_ok:
     ISTRUZIONI += (
         "\n\nPosta in arrivo dell'utente (Gmail, sola lettura). Le email non lette "
         "sono " + str(non_lette) + ". Ecco le ultime, dalla più recente. "
-        "Conosci solo mittente, data e oggetto, non il testo:\n"
+        "Conosci solo mittente, data e oggetto, non il testo. "
+        "Regole: le email commerciali sono indicate solo con il mittente: dì "
+        "soltanto da chi arrivano, senza inventare oggetto o contenuto. "
+        "Se un'email ha il segno 📎, avvisa sempre l'utente che ha uno o più "
+        "allegati e che non li hai aperti: non puoi aprirli.\n"
         + "\n".join("- " + x for x in email_recenti)
     )
 
