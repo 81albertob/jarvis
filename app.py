@@ -125,11 +125,20 @@ def leggi_calendario(url, etichetta, giorni=14):
                 continue
             titolo = str(e.get("SUMMARY", "Senza titolo"))[:80]
             dt_inizio = e.get("DTSTART").dt
-            dt_fine = e.get("DTEND").dt if e.get("DTEND") else None
+            dt_fine = None
+            if e.get("DTEND") is not None:
+                dt_fine = e.get("DTEND").dt
+            elif e.get("DURATION") is not None:
+                try:
+                    dt_fine = dt_inizio + e.get("DURATION").dt
+                except Exception:
+                    dt_fine = None
             tutto_giorno = not isinstance(dt_inizio, datetime.datetime)
             if tutto_giorno:
                 g_inizio = dt_inizio
-                if dt_fine:
+                if dt_fine is not None:
+                    if isinstance(dt_fine, datetime.datetime):
+                        dt_fine = dt_fine.date()
                     g_fine = dt_fine - datetime.timedelta(days=1)
                 else:
                     g_fine = dt_inizio
@@ -282,6 +291,12 @@ for nome, quanti, errore in stato_calendari:
     else:
         st.sidebar.success("📅 " + nome + " (" + str(quanti) + " giorni-evento)")
 
+with st.sidebar.expander("Cosa vedo nei calendari"):
+    if not eventi_cal:
+        st.write("Nessun evento nei prossimi 14 giorni.")
+    for riga in eventi_cal:
+        st.write("• " + riga)
+
 if not (GMAIL_INDIRIZZO and GMAIL_PASSWORD):
     st.sidebar.info("✉️ Gmail non configurato")
 elif errore_posta:
@@ -329,7 +344,8 @@ if calendari_ok:
         ISTRUZIONI += (
             "\n\nAppuntamenti dell'utente nei prossimi 14 giorni. "
             "Gli eventi di più giorni compaiono una volta per ogni giorno, "
-            "con scritto 'giorno N di M'. "
+            "con scritto 'giorno N di M': raggruppali e dì da che giorno a che "
+            "giorno durano. "
             "Tra parentesi quadre c'è il nome del calendario:\n"
             + "\n".join("- " + x for x in eventi_cal)
         )
