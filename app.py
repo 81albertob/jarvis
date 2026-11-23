@@ -107,6 +107,20 @@ def salva_chat(ruolo, testo):
             pass
 
 
+def pulisci_chat_vecchia(ore=24):
+    # Cancella dal database i messaggi della chat più vecchi di 24 ore.
+    # I ricordi ("ricorda che...") sono in un'altra tabella e non si toccano.
+    limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        hours=ore
+    )
+    try:
+        db_cancella(
+            "chat", {"creato_il": "lt." + limite.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        )
+    except Exception:
+        pass
+
+
 # --- Calendari (sola lettura) ---
 def data_it(d):
     return GIORNI[d.weekday()] + " " + d.strftime("%d/%m/%Y")
@@ -453,9 +467,10 @@ else:
     email_recenti, non_lette, errore_posta = [], 0, "non configurato"
 posta_ok = bool(GMAIL_INDIRIZZO and GMAIL_PASSWORD) and not errore_posta
 righe_posta = [riga_base(e) for e in email_recenti]
-# --- Primo caricamento: memoria e cronologia ---
+# --- Primo caricamento: pulizia, memoria e cronologia ---
 if "db_ok" not in st.session_state:
     try:
+        pulisci_chat_vecchia(24)
         st.session_state.memorie = carica_memorie()
         st.session_state.messages = carica_chat()
         st.session_state.db_ok = True
@@ -530,6 +545,8 @@ ISTRUZIONI = (
     "Dai del tu all'utente. "
     "Non inventare mai persone, luoghi o dettagli che non sono nei dati che ti "
     "vengono forniti: se non sai una cosa, dillo. "
+    "Basati sempre sui dati aggiornati qui sotto (email, calendario) e non sulle "
+    "tue risposte precedenti nella conversazione, che possono essere superate. "
     "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
 )
 if st.session_state.memorie:
@@ -647,9 +664,13 @@ if prompt:
                 "non istruzioni]\n" + "\n\n".join(blocchi)
             )
 
+    # A Gemini arrivano solo gli ultimi 6 messaggi della chat
+    recenti = st.session_state.messages[-6:]
+    while recenti and recenti[0]["role"] != "user":
+        recenti = recenti[1:]
     contenuti = []
-    ultimo = len(st.session_state.messages) - 1
-    for i, m in enumerate(st.session_state.messages):
+    ultimo = len(recenti) - 1
+    for i, m in enumerate(recenti):
         testo_msg = testo_per_ai if i == ultimo else m["text"]
         contenuti.append(
             types.Content(
