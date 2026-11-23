@@ -422,7 +422,53 @@ def leggi_dettaglio(indirizzo, password, uid):
         m.login(indirizzo, password)
         m.select("INBOX", readonly=True)
         _, h = m.uid("fetch", uid, "(BODY.PEEK[HEADER])")
-        # --- Primo caricamento: pulizia, memoria e cronologia ---
+        _, t = m.uid("fetch", uid, "(BODY.PEEK[TEXT]<0.30000>)")
+        msg = email.message_from_bytes(h[0][1] + b"\r\n" + t[0][1])
+        return estrai_testo(msg)[:2500]
+    except Exception:
+        return ""
+    finally:
+        if m is not None:
+            try:
+                m.logout()
+            except Exception:
+                pass
+
+
+def email_richieste(prompt, lista):
+    # Capisce quali email vuoi leggere: per numero o per nome del mittente.
+    p = prompt.lower()
+    verbi = ("legg", "apri", "contenut", "cosa dice", "riassum", "dettagli", "oggetto")
+    if not any(v in p for v in verbi):
+        return []
+    numeri = set(int(x) for x in re.findall(r"\b(\d{1,2})\b", p))
+    scelte = []
+    for e in lista:
+        if e["commerciale"]:
+            continue
+        trovata = e["n"] in numeri
+        nome = e["mittente"].lower()
+        if not trovata and nome and nome in p:
+            trovata = True
+        if not trovata:
+            for tok in re.findall(r"[a-zà-ú]{4,}", nome):
+                if tok not in PAROLE_COMUNI and tok in p:
+                    trovata = True
+                    break
+        if trovata:
+            scelte.append(e)
+    return scelte[:3]
+
+
+GMAIL_INDIRIZZO = str(st.secrets.get("GMAIL_ADDRESS", "")).strip()
+GMAIL_PASSWORD = str(st.secrets.get("GMAIL_APP_PASSWORD", "")).replace(" ", "").strip()
+if GMAIL_INDIRIZZO and GMAIL_PASSWORD:
+    email_recenti, non_lette, errore_posta = leggi_posta(GMAIL_INDIRIZZO, GMAIL_PASSWORD)
+else:
+    email_recenti, non_lette, errore_posta = [], 0, "non configurato"
+posta_ok = bool(GMAIL_INDIRIZZO and GMAIL_PASSWORD) and not errore_posta
+righe_posta = [riga_base(e) for e in email_recenti]
+# --- Primo caricamento: pulizia, memoria e cronologia ---
 if "db_ok" not in st.session_state:
     try:
         pulisci_chat_vecchia(24)
