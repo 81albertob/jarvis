@@ -222,7 +222,16 @@ def leggi_calendario(url, etichetta, giorni=14):
                 quando = data_it(g1) + " " + ev["ora"]
                 chiave = g1.strftime("%Y-%m-%d") + " " + ev["ora"]
             elenco.append(
-                (chiave, quando + " - " + ev["titolo"] + " [" + etichetta + "]")
+                (
+                    chiave,
+                    quando + " - " + ev["titolo"] + " [" + etichetta + "]",
+                    g1.isoformat(),
+                    g2.isoformat(),
+                    ev["ora"],
+                    ev["titolo"],
+                    etichetta,
+                    ev["tutto"],
+                )
             )
         return elenco, ""
     except Exception as ex:
@@ -468,7 +477,112 @@ else:
     email_recenti, non_lette, errore_posta = [], 0, "non configurato"
 posta_ok = bool(GMAIL_INDIRIZZO and GMAIL_PASSWORD) and not errore_posta
 righe_posta = [riga_base(e) for e in email_recenti]
-# --- Primo caricamento: pulizia, memoria e cronologia ---
+
+
+# --- Briefing del mattino (composto dal codice, senza Gemini) ---
+def eventi_del_giorno(giorno):
+    trovati = []
+    for ev in tutti_eventi:
+        g1 = datetime.date.fromisoformat(ev[2])
+        g2 = datetime.date.fromisoformat(ev[3])
+        if not (g1 <= giorno <= g2):
+            continue
+        ora = ev[4]
+        titolo = ev[5]
+        cal = ev[6]
+        if ora and g1 == giorno:
+            testo = ora + " - " + titolo
+            chiave = ora
+        elif ora:
+            testo = "in corso (fino a " + data_it(g2) + ") - " + titolo
+            chiave = "00:00"
+        else:
+            testo = "tutto il giorno - " + titolo
+            if g2 > g1:
+                testo += " (fino a " + data_it(g2) + ")"
+            chiave = "00:00"
+        trovati.append((chiave, testo + " [" + cal + "]"))
+    trovati.sort()
+    return [t[1] for t in trovati]
+
+
+def costruisci_briefing():
+    oggi_b = datetime.datetime.now(FUSO).date()
+    domani_b = oggi_b + datetime.timedelta(days=1)
+    righe = ["**☀️ Buongiorno! Oggi è " + data_it(oggi_b) + ".**", ""]
+
+    # Appuntamenti
+    righe.append("**📅 Appuntamenti di oggi**")
+    if not CALENDARI:
+        righe.append("- Nessun calendario configurato.")
+    else:
+        oggi_ev = eventi_del_giorno(oggi_b)
+        if oggi_ev:
+            righe.extend("- " + x for x in oggi_ev)
+        else:
+            righe.append("- Nessun appuntamento oggi.")
+        righe.append("")
+        righe.append("**📅 Domani, " + data_it(domani_b) + "**")
+        domani_ev = eventi_del_giorno(domani_b)
+        if domani_ev:
+            righe.extend("- " + x for x in domani_ev)
+        else:
+            righe.append("- Nessun appuntamento.")
+        guasti = [s[0] for s in stato_calendari if s[2]]
+        if guasti:
+            righe.append("")
+            righe.append(
+                "⚠️ Calendari non letti: " + ", ".join(guasti)
+            )
+    righe.append("")
+
+    # Email
+    righe.append("**✉️ Email di oggi**")
+    if not (GMAIL_INDIRIZZO and GMAIL_PASSWORD):
+        righe.append("- Gmail non configurato.")
+    elif errore_posta:
+        righe.append("- Gmail non collegato al momento.")
+    else:
+        oggi_s = oggi_b.strftime("%d/%m/%Y")
+        di_oggi = [e for e in email_recenti if e["quando"].startswith(oggi_s)]
+        normali = [e for e in di_oggi if not e["commerciale"]]
+        commerciali = [e for e in di_oggi if e["commerciale"]]
+        if not di_oggi:
+            righe.append("- Nessuna email oggi.")
+        for e in normali:
+            s = "- " + str(e["n"]) + ". " + e["quando"][11:16] + " - " + e["mittente"]
+            if not e["letta"]:
+                s += " [NON LETTA]"
+            if e["allegati"]:
+                s += (
+                    " [📎 " + str(e["allegati"])
+                    + (" allegato" if e["allegati"] == 1 else " allegati")
+                    + " - NON aperti]"
+                )
+            righe.append(s)
+        if commerciali:
+            nomi = []
+            for e in commerciali:
+                if e["mittente"] not in nomi:
+                    nomi.append(e["mittente"])
+            righe.append(
+                "- " + str(len(commerciali)) + " email commerciali: "
+                + ", ".join(nomi)
+            )
+        righe.append("")
+        righe.append("Email non lette in totale: " + str(non_lette) + ".")
+        if len(di_oggi) >= len(email_recenti) and len(email_recenti) >= 20:
+            righe.append("(Ho controllato solo le ultime 20 email.)")
+        if normali:
+            righe.append("")
+            righe.append(
+                "Dimmi quale vuoi che legga, per esempio: «leggi la numero "
+                + str(normali[0]["n"]) + "»."
+            )
+    righe.append("")
+    righe.append("Buona giornata!")
+    return "\n".join(righe)
+    # --- Primo caricamento: pulizia, memoria e cronologia ---
 if "db_ok" not in st.session_state:
     try:
         pulisci_chat_vecchia(24)
@@ -484,6 +598,17 @@ if "db_ok" not in st.session_state:
 
 # --- Menu laterale ---
 st.sidebar.header("Jarvis")
+
+if st.sidebar.button("☀️ Briefing del mattino"):
+    st.session_state.messages.append(
+        {"role": "user", "text": "Briefing del mattino"}
+    )
+    salva_chat("user", "Briefing del mattino")
+    testo_b = costruisci_briefing()
+    st.session_state.messages.append({"role": "assistant", "text": testo_b})
+    salva_chat("assistant", testo_b)
+    st.rerun()
+
 usa_web = st.sidebar.checkbox("🔎 Ricerca online", value=True)
 
 if st.session_state.db_ok:
@@ -610,6 +735,15 @@ if prompt:
     salva_chat("user", prompt)
     with st.chat_message("user"):
         st.markdown(prompt)
+
+    # Briefing del mattino: "buongiorno" o "briefing" (frasi corte)
+    if len(prompt.split()) <= 4 and re.search(
+        r"\b(briefing|buongiorno)\b", prompt, flags=re.IGNORECASE
+    ):
+        testo = costruisci_briefing()
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
 
     # Comando "ricorda ..." (anche in mezzo alla frase)
     trovato = re.search(r"\bricord(a|ati)\b", prompt, flags=re.IGNORECASE)
