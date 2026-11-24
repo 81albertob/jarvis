@@ -81,6 +81,12 @@ def db_scrivi(tabella, dati):
     r.raise_for_status()
 
 
+def db_aggiorna(tabella, params, dati):
+    h = dict(DB_HEADERS, Prefer="return=minimal")
+    r = requests.patch(DB_URL + tabella, headers=h, params=params, json=dati, timeout=10)
+    r.raise_for_status()
+
+
 def db_cancella(tabella, params):
     r = requests.delete(DB_URL + tabella, headers=DB_HEADERS, params=params, timeout=10)
     r.raise_for_status()
@@ -110,7 +116,7 @@ def salva_chat(ruolo, testo):
 
 def pulisci_chat_vecchia(ore=24):
     # Cancella dal database i messaggi della chat più vecchi di 24 ore.
-    # I ricordi ("ricorda che...") sono in un'altra tabella e non si toccano.
+    # I ricordi e i promemoria sono in altre tabelle e non si toccano.
     limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
         hours=ore
     )
@@ -120,6 +126,154 @@ def pulisci_chat_vecchia(ore=24):
         )
     except Exception:
         pass
+
+
+# --- Promemoria ---
+def carica_promemoria():
+    return db_leggi(
+        "promemoria",
+        {
+            "select": "id,testo,scadenza",
+            "fatto": "eq.false",
+            "order": "scadenza.asc.nullslast,id.asc",
+        },
+    )
+
+
+MESI = {
+    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5,
+    "giugno": 6, "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10,
+    "novembre": 11, "dicembre": 12,
+}
+NOMI_GIORNI = {
+    "lunedì": 0, "lunedi": 0, "martedì": 1, "martedi": 1,
+    "mercoledì": 2, "mercoledi": 2, "giovedì": 3, "giovedi": 3,
+    "venerdì": 4, "venerdi": 4, "sabato": 5, "domenica": 6,
+}
+
+
+def _taglia(testo, m):
+    return testo[: m.start()] + " " + testo[m.end():]
+
+
+def estrai_data(testo):
+    # Cerca una data nel testo. Restituisce (data o None, testo senza la data).
+    oggi_d = datetime.datetime.now(FUSO).date()
+    low = testo.lower()
+
+    m = re.search(r"\b(\d{1,2})[/.\-](\d{1,2})(?:[/.\-](\d{2,4}))?\b", low)
+    if m:
+        g, me = int(m.group(1)), int(m.group(2))
+        anno = int(m.group(3)) if m.group(3) else oggi_d.year
+        if anno < 100:
+            anno += 2000
+        try:
+            d = datetime.date(anno, me, g)
+            if not m.group(3) and d < oggi_d:
+                d = datetime.date(anno + 1, me, g)
+            return d, _taglia(testo, m)
+        except ValueError:
+            pass
+
+    m = re.search(r"\b(\d{1,2})\s+(" + "|".join(MESI) + r")\b", low)
+    if m:
+        g, me = int(m.group(1)), MESI[m.group(2)]
+        try:
+            d = datetime.date(oggi_d.year, me, g)
+            if d < oggi_d:
+                d = datetime.date(oggi_d.year + 1, me, g)
+            return d, _taglia(testo, m)
+        except ValueError:
+            pass
+
+    m = re.search(r"\bdopodomani\b", low)
+    if m:
+        return oggi_d + datetime.timedelta(days=2), _taglia(testo, m)
+    m = re.search(r"\bdomani\b", low)
+    if m:
+        return oggi_d + datetime.timedelta(days=1), _taglia(testo, m)
+    m = re.search(r"\boggi\b", low)
+    if m:
+        return oggi_d, _taglia(testo, m)
+    m = re.search(r"\btra\s+(\d{1,2})\s+giorni?\b", low)
+    if m:
+        return oggi_d + datetime.timedelta(days=int(m.group(1))), _taglia(testo, m)
+    for nome, num in NOMI_GIORNI.items():
+        m = re.search(r"\b" + nome + r"\b", low)
+        if m:
+            avanti = (num - oggi_d.weekday()) % 7 or 7
+            return oggi_d + datetime.timedelta(days=avanti), _taglia(testo, m)
+    return None, testo
+
+
+def descrivi_promemoria(p):
+    if not p.get("scadenza"):
+        return p["testo"] + " (senza scadenza)"
+    oggi_p = datetime.datetime.now(FUSO).date()
+    d = datetime.date.fromisoformat(p["scadenza"])
+    diff = (d - oggi_p).days
+    if diff < 0:
+        quando = "SCADUTO il " + data_it(d)
+    elif diff == 0:
+        quando = "oggi"
+    elif diff == 1:
+        quando = "domani"
+    else:
+        quando = data_it(d)
+    return p["testo"] + " (" + quando + ")"
+
+
+# --- Meteo (Open-Meteo: gratuito, senza chiave) ---
+CITTA_METEO = str(st.secrets.get("METEO_CITTA", "Rimini")).strip() or "Rimini"
+CODICI_METEO = {
+    0: "sereno", 1: "prevalentemente sereno", 2: "parzialmente nuvoloso",
+    3: "coperto", 45: "nebbia", 48: "nebbia con brina",
+    51: "pioviggine leggera", 53: "pioviggine", 55: "pioviggine intensa",
+    56: "pioggerella gelata", 57: "pioggerella gelata intensa",
+    61: "pioggia debole", 63: "pioggia", 65: "pioggia forte",
+    66: "pioggia gelata", 67: "pioggia gelata forte",
+    71: "neve debole", 73: "neve", 75: "neve forte", 77: "granelli di neve",
+    80: "rovesci deboli", 81: "rovesci", 82: "rovesci violenti",
+    85: "rovesci di neve", 86: "forti rovesci di neve",
+    95: "temporale", 96: "temporale con grandine", 99: "forte temporale con grandine",
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def leggi_meteo(citta):
+    try:
+        g = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": citta, "count": 1, "language": "it"},
+            timeout=10,
+        ).json()
+        luogo = g["results"][0]
+        f = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": luogo["latitude"],
+                "longitude": luogo["longitude"],
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max",
+                "timezone": "Europe/Rome",
+                "forecast_days": 2,
+            },
+            timeout=10,
+        ).json()
+        d = f["daily"]
+        giorni = []
+        for i in range(len(d["time"])):
+            giorni.append(
+                {
+                    "cielo": CODICI_METEO.get(d["weather_code"][i], "variabile"),
+                    "min": round(d["temperature_2m_min"][i]),
+                    "max": round(d["temperature_2m_max"][i]),
+                    "pioggia": d["precipitation_probability_max"][i],
+                }
+            )
+        return luogo["name"], giorni, ""
+    except Exception as ex:
+        return citta, [], str(ex)[:150]
 
 
 # --- Calendari (sola lettura) ---
@@ -511,6 +665,58 @@ def costruisci_briefing():
     domani_b = oggi_b + datetime.timedelta(days=1)
     righe = ["**☀️ Buongiorno! Oggi è " + data_it(oggi_b) + ".**", ""]
 
+    # Meteo
+    nome_citta, giorni_meteo, errore_meteo = leggi_meteo(CITTA_METEO)
+    righe.append("**🌤️ Meteo a " + nome_citta + "**")
+    if errore_meteo or not giorni_meteo:
+        righe.append("- Meteo non disponibile al momento.")
+    else:
+        for i, nome_g in enumerate(["Oggi", "Domani"]):
+            if i < len(giorni_meteo):
+                g = giorni_meteo[i]
+                s = (
+                    "- " + nome_g + ": " + g["cielo"] + ", "
+                    + str(g["min"]) + "°–" + str(g["max"]) + "°C"
+                )
+                if g["pioggia"] is not None:
+                    s += ", probabilità di pioggia " + str(g["pioggia"]) + "%"
+                righe.append(s)
+        righe.append("Dati meteo: [Open-Meteo.com](https://open-meteo.com)")
+    righe.append("")
+
+    # Promemoria
+    righe.append("**⏰ Promemoria**")
+    if not st.session_state.get("prom_ok", False):
+        righe.append("- Tabella dei promemoria non trovata.")
+    else:
+        elenco_p = st.session_state.promemoria
+        scaduti = [
+            p for p in elenco_p
+            if p["scadenza"] and datetime.date.fromisoformat(p["scadenza"]) < oggi_b
+        ]
+        di_oggi_p = [
+            p for p in elenco_p
+            if p["scadenza"] and datetime.date.fromisoformat(p["scadenza"]) == oggi_b
+        ]
+        prossimi = [
+            p for p in elenco_p
+            if p["scadenza"]
+            and oggi_b < datetime.date.fromisoformat(p["scadenza"])
+            <= oggi_b + datetime.timedelta(days=7)
+        ]
+        senza = [p for p in elenco_p if not p["scadenza"]]
+        if not (scaduti or di_oggi_p or prossimi or senza):
+            righe.append("- Nessun promemoria.")
+        for p in scaduti:
+            righe.append("- ⚠️ " + descrivi_promemoria(p))
+        for p in di_oggi_p:
+            righe.append("- " + descrivi_promemoria(p))
+        for p in prossimi:
+            righe.append("- " + descrivi_promemoria(p))
+        for p in senza:
+            righe.append("- " + descrivi_promemoria(p))
+    righe.append("")
+
     # Appuntamenti
     righe.append("**📅 Appuntamenti di oggi**")
     if not CALENDARI:
@@ -531,9 +737,7 @@ def costruisci_briefing():
         guasti = [s[0] for s in stato_calendari if s[2]]
         if guasti:
             righe.append("")
-            righe.append(
-                "⚠️ Calendari non letti: " + ", ".join(guasti)
-            )
+            righe.append("⚠️ Calendari non letti: " + ", ".join(guasti))
     righe.append("")
 
     # Email
@@ -582,7 +786,7 @@ def costruisci_briefing():
     righe.append("")
     righe.append("Buona giornata!")
     return "\n".join(righe)
-    # --- Primo caricamento: pulizia, memoria e cronologia ---
+    # --- Primo caricamento: pulizia, memoria, cronologia, promemoria ---
 if "db_ok" not in st.session_state:
     try:
         pulisci_chat_vecchia(24)
@@ -595,6 +799,33 @@ if "db_ok" not in st.session_state:
         st.session_state.messages = []
         st.session_state.db_ok = False
         st.session_state.db_errore = str(e)[:300]
+    try:
+        st.session_state.promemoria = carica_promemoria()
+        st.session_state.prom_ok = True
+    except Exception:
+        st.session_state.promemoria = []
+        st.session_state.prom_ok = False
+
+# --- Briefing automatico: prima apertura del mattino (dalle 5 alle 12) ---
+if "briefing_auto" not in st.session_state:
+    st.session_state.briefing_auto = True
+    ora_b = datetime.datetime.now(FUSO)
+    if st.session_state.db_ok and 5 <= ora_b.hour < 12:
+        intestazione = "**☀️ Buongiorno! Oggi è " + data_it(ora_b.date()) + ".**"
+        gia_fatto = any(
+            m["role"] == "assistant" and m["text"].startswith(intestazione)
+            for m in st.session_state.messages
+        )
+        if not gia_fatto:
+            st.session_state.messages.append(
+                {"role": "user", "text": "Briefing automatico"}
+            )
+            salva_chat("user", "Briefing automatico")
+            testo_auto = costruisci_briefing()
+            st.session_state.messages.append(
+                {"role": "assistant", "text": testo_auto}
+            )
+            salva_chat("assistant", testo_auto)
 
 # --- Menu laterale ---
 st.sidebar.header("Jarvis")
@@ -615,6 +846,24 @@ if st.session_state.db_ok:
     st.sidebar.success("🧠 Memoria collegata")
 else:
     st.sidebar.error("Memoria NON collegata: " + st.session_state.db_errore)
+
+with st.sidebar.expander(
+    "⏰ Promemoria (" + str(len(st.session_state.promemoria)) + ")"
+):
+    if not st.session_state.prom_ok:
+        st.write("Tabella dei promemoria non trovata: va creata su Supabase.")
+    elif not st.session_state.promemoria:
+        st.write("Nessun promemoria. Scrivi: ricordami di ...")
+    for p in st.session_state.promemoria:
+        if st.button("✅ " + descrivi_promemoria(p)[:50], key="prom" + str(p["id"])):
+            try:
+                db_aggiorna(
+                    "promemoria", {"id": "eq." + str(p["id"])}, {"fatto": True}
+                )
+                st.session_state.promemoria = carica_promemoria()
+            except Exception:
+                pass
+            st.rerun()
 
 if not CALENDARI:
     st.sidebar.info("📅 Calendario non configurato")
@@ -667,17 +916,23 @@ ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
     "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
     f"Data e ora attuali (Italia): {oggi}. "
-    "Non dire mai di aver salvato o annotato qualcosa: lo fa un comando a parte. "
+    "Non dire mai di aver salvato, annotato o creato qualcosa (ricordi, promemoria): "
+    "lo fa un comando a parte. "
     "Dai del tu all'utente. "
     "Non inventare mai persone, luoghi o dettagli che non sono nei dati che ti "
     "vengono forniti: se non sai una cosa, dillo. "
-    "Basati sempre sui dati aggiornati qui sotto (email, calendario) e non sulle "
-    "tue risposte precedenti nella conversazione, che possono essere superate. "
+    "Basati sempre sui dati aggiornati qui sotto (email, calendario, promemoria) "
+    "e non sulle tue risposte precedenti nella conversazione, che possono essere "
+    "superate. "
     "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
 )
 if st.session_state.memorie:
     ISTRUZIONI += "\n\nCose che sai sull'utente (memoria permanente):\n" + "\n".join(
         "- " + m["testo"] for m in st.session_state.memorie
+    )
+if st.session_state.promemoria:
+    ISTRUZIONI += "\n\nPromemoria dell'utente non ancora fatti:\n" + "\n".join(
+        "- " + descrivi_promemoria(p) for p in st.session_state.promemoria
     )
 if calendari_ok:
     if eventi_cal:
@@ -745,6 +1000,65 @@ if prompt:
         salva_chat("assistant", testo)
         st.rerun()
 
+    # Nuovo promemoria: "ricordami di ..." / "aggiungi promemoria ..."
+    schema_nuovo = (
+        r"\bricordami\b|\b(nuovo|aggiungi|crea)\s+(un\s+)?promemoria\b"
+    )
+    if re.search(schema_nuovo, prompt, flags=re.IGNORECASE):
+        resto = re.sub(schema_nuovo, " ", prompt, flags=re.IGNORECASE)
+        data_p, resto = estrai_data(resto)
+        resto = resto.strip(" :,-")
+        resto = re.sub(r"^(di|che)\s+", "", resto, flags=re.IGNORECASE).strip(" :,-")
+        resto = re.sub(
+            r"\s+(il|per|entro|di|a|alle|e)\s*$", "", resto, flags=re.IGNORECASE
+        ).strip()
+        resto = re.sub(r"\s+", " ", resto)
+        if not resto:
+            testo = "Cosa devo ricordarti? Scrivi per esempio: ricordami di chiamare il dentista giovedì."
+        elif not st.session_state.prom_ok:
+            testo = "ERRORE: la tabella dei promemoria non esiste ancora su Supabase."
+        else:
+            try:
+                db_scrivi(
+                    "promemoria",
+                    {
+                        "testo": resto,
+                        "scadenza": data_p.isoformat() if data_p else None,
+                    },
+                )
+                st.session_state.promemoria = carica_promemoria()
+                if data_p:
+                    testo = (
+                        "Promemoria aggiunto: " + resto + " — per " + data_it(data_p)
+                    )
+                else:
+                    testo = "Promemoria aggiunto: " + resto + " (senza scadenza)"
+            except Exception as e:
+                testo = "ERRORE nel salvare il promemoria: " + str(e)[:300]
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
+    # Elenco dei promemoria
+    if re.search(
+        r"\b(promemoria|cose da fare|da fare)\b", prompt, flags=re.IGNORECASE
+    ):
+        if not st.session_state.prom_ok:
+            testo = "La tabella dei promemoria non esiste ancora su Supabase."
+        elif not st.session_state.promemoria:
+            testo = "Non hai promemoria in sospeso."
+        else:
+            testo = (
+                "**⏰ I tuoi promemoria**\n\n"
+                + "\n".join(
+                    "- " + descrivi_promemoria(p) for p in st.session_state.promemoria
+                )
+                + "\n\nPer segnarne uno come fatto usa il pulsante ✅ nel menu a sinistra."
+            )
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
     # Comando "ricorda ..." (anche in mezzo alla frase)
     trovato = re.search(r"\bricord(a|ati)\b", prompt, flags=re.IGNORECASE)
     if trovato:
@@ -766,9 +1080,10 @@ if prompt:
         salva_chat("assistant", testo)
         st.rerun()
 
-    # Ricerca web (non serve per domande su calendario o posta)
+    # Ricerca web (non serve per domande su calendario, posta o promemoria)
     parole_interne = (
-        "appuntament", "calendario", "agenda", "impegn", "mail", "posta", "messaggi",
+        "appuntament", "calendario", "agenda", "impegn", "mail", "posta",
+        "messaggi", "promemoria",
     )
     parla_di_cose_tue = any(p in prompt.lower() for p in parole_interne)
     testo_per_ai = prompt
