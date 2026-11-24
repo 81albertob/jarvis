@@ -1,9 +1,12 @@
+import base64
 import datetime
 import email
 import imaplib
+import io
 import json
 import re
 import time
+import wave
 from email.header import decode_header, make_header
 from email.utils import parseaddr, parsedate_to_datetime
 from zoneinfo import ZoneInfo
@@ -130,16 +133,29 @@ def pulisci_chat_vecchia(ore=24):
         pass
 
 
-# --- Voce: legge ad alta voce con la sintesi vocale del browser ---
-def pulsante_voce(testo, auto=False):
-    pulito = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", testo)
-    pulito = re.sub(r"https?://\S+", "", pulito)
-    pulito = re.sub(
-        r"[\U00010000-\U0010ffff\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]", "", pulito
+# --- Voce ---
+def testo_per_voce(testo, massimo=1500):
+    # Toglie emoji, simboli e link, e prepara il testo da leggere.
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", testo)
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(
+        r"[\U00010000-\U0010ffff\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]", "", s
     )
-    pulito = re.sub(r"[*_`#>|]", "", pulito)
-    pulito = pulito.replace("°C", " gradi")
-    pulito = re.sub(r"\s+", " ", pulito).strip()[:1500]
+    s = re.sub(r"(\d+)°\s*[–-]\s*(\d+)°C", r"da \1 a \2 gradi", s)
+    s = s.replace("°C", " gradi")
+    s = re.sub(r"[*_`#>|]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > massimo:
+        s = s[:massimo]
+        k = max(s.rfind(". "), s.rfind("! "), s.rfind("? "))
+        if k > 300:
+            s = s[: k + 1]
+    return s
+
+
+def pulsante_voce(testo, auto=False):
+    # Voce del browser (veloce ma robotica)
+    pulito = testo_per_voce(testo, 1500)
     if not pulito:
         return
     js_testo = json.dumps(pulito).replace("</", "<\\/")
@@ -184,6 +200,107 @@ if (__AUTO__) { setTimeout(parla, 300); }
         "__AUTO__", "true" if auto else "false"
     )
     components.html(html, height=48)
+
+
+VOCI_NATURALI = [
+    "Charon", "Algieba", "Orus", "Iapetus", "Alnilam", "Umbriel",
+    "Fenrir", "Puck", "Kore", "Zephyr",
+]
+MODELLI_VOCE = [
+    "gemini-3.1-flash-tts-preview",
+    "gemini-3.8-flash-tts",
+    "gemini-2.5-flash-preview-tts",
+]
+STILE_JARVIS = (
+    "Say in Italian, in a calm, refined, confident and slightly witty tone, "
+    "like an elegant AI butler, with smooth and natural pacing: "
+)
+
+
+def pcm_a_wav(pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def sintetizza(testo, voce):
+    # Voce naturale con Gemini. Se fallisce solleva un errore (non viene
+    # memorizzato), così puoi riprovare.
+    errori = []
+    for modello in MODELLI_VOCE:
+        try:
+            r = client.models.generate_content(
+                model=modello,
+                contents=STILE_JARVIS + testo,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voce
+                            )
+                        )
+                    ),
+                ),
+            )
+            dati = r.candidates[0].content.parts[0].inline_data.data
+            if isinstance(dati, str):
+                dati = base64.b64decode(dati)
+            if dati:
+                return pcm_a_wav(dati)
+            errori.append(modello + ": risposta vuota")
+        except Exception as ex:
+            errori.append(modello + ": " + str(ex)[:150])
+    raise RuntimeError(" | ".join(errori))
+
+
+def mostra_voce(testo, auto):
+    # Sotto l'ultima risposta: voce naturale (Gemini) o voce del browser.
+    if st.session_state.tipo_voce.startswith("Del browser"):
+        pulsante_voce(testo, auto)
+        return
+    pulito = testo_per_voce(testo, 1200)
+    if not pulito:
+        return
+    voce = st.session_state.nome_voce
+    chiave = voce + "|" + pulito
+    corrente = st.session_state.get("audio_corrente")
+    gia_pronto = bool(corrente and corrente["chiave"] == chiave)
+    if auto and not gia_pronto:
+        richiesta = True
+    else:
+        richiesta = st.button("🎙️ Voce naturale", key="btn_voce_nat")
+    if richiesta:
+        with st.spinner("Preparo la voce..."):
+            try:
+                wav = sintetizza(pulito, voce)
+                st.session_state.audio_corrente = {
+                    "chiave": chiave,
+                    "wav": wav,
+                    "play": True,
+                }
+                st.session_state.errore_voce = ""
+            except Exception as ex:
+                st.session_state.audio_corrente = None
+                st.session_state.errore_voce = str(ex)[:500]
+    corrente = st.session_state.get("audio_corrente")
+    if corrente and corrente["chiave"] == chiave:
+        try:
+            st.audio(corrente["wav"], format="audio/wav", autoplay=corrente["play"])
+        except TypeError:
+            st.audio(corrente["wav"], format="audio/wav")
+        corrente["play"] = False
+    elif st.session_state.get("errore_voce"):
+        st.warning(
+            "Voce naturale non disponibile: " + st.session_state.errore_voce
+            + " — riprova tra un minuto (il piano gratuito ammette poche "
+            "richieste al minuto) oppure scegli «Del browser» nel menu."
+        )
 
 
 # --- Promemoria ---
@@ -900,6 +1017,10 @@ if st.sidebar.button("☀️ Briefing del mattino"):
     st.rerun()
 
 usa_web = st.sidebar.checkbox("🔎 Ricerca online", value=True)
+st.sidebar.selectbox(
+    "🎙️ Tipo di voce", ["Naturale (Gemini)", "Del browser"], key="tipo_voce"
+)
+st.sidebar.selectbox("Voce naturale", VOCI_NATURALI, key="nome_voce")
 st.sidebar.checkbox("🔊 Voce automatica", value=False, key="voce_auto")
 
 if st.session_state.db_ok:
@@ -1045,7 +1166,7 @@ for m in st.session_state.messages:
 
 prompt = st.chat_input("Parla con Jarvis...")
 
-# Pulsante voce sotto l'ultima risposta
+# Voce sotto l'ultima risposta (naturale o del browser)
 if (
     not prompt
     and st.session_state.messages
@@ -1055,10 +1176,11 @@ if (
         st.session_state.voce_auto
         and st.session_state.get("voce_letto") != len(st.session_state.messages)
     )
-    pulsante_voce(st.session_state.messages[-1]["text"], auto_voce)
+    mostra_voce(st.session_state.messages[-1]["text"], auto_voce)
     st.session_state.voce_letto = len(st.session_state.messages)
 
 if prompt:
+    st.session_state.errore_voce = ""
     st.session_state.messages.append({"role": "user", "text": prompt})
     salva_chat("user", prompt)
     with st.chat_message("user"):
@@ -1233,8 +1355,8 @@ if prompt:
                 else:
                     testo = "Non ho ricevuto risposta."
         st.markdown(testo)
-        pulsante_voce(testo, st.session_state.voce_auto)
 
     st.session_state.messages.append({"role": "assistant", "text": testo})
     salva_chat("assistant", testo)
-    st.session_state.voce_letto = len(st.session_state.messages)
+    st.rerun()
+    
