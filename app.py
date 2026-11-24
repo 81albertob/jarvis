@@ -153,7 +153,7 @@ def testo_per_voce(testo, massimo=1500):
     return s
 
 
-def pulsante_voce(testo, auto=False):
+def pulsante_voce(testo, auto=False, velocita=1.0):
     # Voce del browser (veloce ma robotica)
     pulito = testo_per_voce(testo, 1500)
     if not pulito:
@@ -172,6 +172,7 @@ button:hover { border-color: #00d4ff; }
 <button id="b">🔊 Leggi ad alta voce</button><button id="s">⏹ Stop</button>
 <script>
 const testo = __TESTO__;
+const velocita = __RATE__;
 function parla() {
   const sy = window.speechSynthesis;
   if (!sy) { return; }
@@ -185,6 +186,7 @@ function parla() {
     if (!frase.trim()) { return; }
     const u = new SpeechSynthesisUtterance(frase);
     u.lang = "it-IT";
+    u.rate = velocita;
     if (v) { u.voice = v; }
     sy.speak(u);
   });
@@ -196,27 +198,32 @@ document.getElementById("s").onclick = function () {
 if (__AUTO__) { setTimeout(parla, 300); }
 </script>
 """
-    html = html.replace("__TESTO__", js_testo).replace(
-        "__AUTO__", "true" if auto else "false"
+    html = (
+        html.replace("__TESTO__", js_testo)
+        .replace("__AUTO__", "true" if auto else "false")
+        .replace("__RATE__", str(float(velocita)))
     )
     components.html(html, height=48)
 
 
 VOCI_NATURALI = [
-    "Charon", "Algieba", "Orus", "Iapetus", "Alnilam", "Umbriel",
-    "Fenrir", "Puck", "Kore", "Zephyr",
+    "Charon", "Orus", "Alnilam", "Sadaltager", "Rasalgethi", "Algieba",
+    "Iapetus", "Schedar", "Erinome", "Umbriel", "Kore", "Fenrir", "Puck", "Zephyr",
 ]
 URL_VOCE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 )
 STILE_JARVIS = (
-    "Say in Italian, in a calm, refined, confident and slightly witty tone, "
-    "like an elegant AI butler, with smooth and natural pacing: "
+    "Say in Italian, in a composed, professional and authoritative tone, "
+    "like a top-tier executive assistant: clear diction, confident, crisp and "
+    "efficient, at a brisk steady pace with short pauses: "
 )
 STILE_BREVE = (
-    "calm, refined, confident and slightly witty, like an elegant AI butler, "
-    "with smooth and natural pacing"
+    "composed, professional and authoritative, like a top-tier executive "
+    "assistant, clear diction, crisp and efficient, brisk steady pace, "
+    "short pauses"
 )
+VERSIONE_STILE = "v2"
 
 
 def pcm_a_wav(pcm, rate=24000):
@@ -268,7 +275,7 @@ TENTATIVI_VOCE = [
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def sintetizza(testo, voce):
+def sintetizza(testo, voce, versione):
     # Voce naturale: chiama direttamente il servizio di Gemini.
     # Se fallisce solleva un errore (non viene memorizzato): puoi riprovare.
     chiave_api = st.secrets["GEMINI_API_KEY"].strip()
@@ -313,10 +320,38 @@ def sintetizza(testo, voce):
     raise RuntimeError(" | ".join(errori))
 
 
+def lettore_audio(wav, velocita, avvia):
+    # Lettore audio con velocità regolabile (il tono della voce resta uguale).
+    b64 = base64.b64encode(wav).decode()
+    html = """
+<style>body { margin: 0; background: transparent; } audio { width: 100%; }</style>
+<audio id="a" controls src="data:audio/wav;base64,__B64__"></audio>
+<script>
+const a = document.getElementById("a");
+const v = __VEL__;
+function imposta() { a.defaultPlaybackRate = v; a.playbackRate = v; }
+a.addEventListener("loadedmetadata", imposta);
+a.addEventListener("play", imposta);
+imposta();
+if (__PLAY__) {
+  const p = a.play();
+  if (p) { p.catch(function () {}); }
+}
+</script>
+"""
+    html = (
+        html.replace("__B64__", b64)
+        .replace("__VEL__", str(float(velocita)))
+        .replace("__PLAY__", "true" if avvia else "false")
+    )
+    components.html(html, height=60)
+
+
 def mostra_voce(testo, auto):
     # Sotto l'ultima risposta: voce naturale (Gemini) o voce del browser.
+    velocita = st.session_state.get("velocita_voce", 1.15)
     if st.session_state.tipo_voce.startswith("Del browser"):
-        pulsante_voce(testo, auto)
+        pulsante_voce(testo, auto, velocita)
         return
     pulito = testo_per_voce(testo, 1200)
     if not pulito:
@@ -332,7 +367,7 @@ def mostra_voce(testo, auto):
     if richiesta:
         with st.spinner("Preparo la voce..."):
             try:
-                wav = sintetizza(pulito, voce)
+                wav = sintetizza(pulito, voce, VERSIONE_STILE)
                 st.session_state.audio_corrente = {
                     "chiave": chiave,
                     "wav": wav,
@@ -344,10 +379,7 @@ def mostra_voce(testo, auto):
                 st.session_state.errore_voce = str(ex)[:900]
     corrente = st.session_state.get("audio_corrente")
     if corrente and corrente["chiave"] == chiave:
-        try:
-            st.audio(corrente["wav"], format="audio/wav", autoplay=corrente["play"])
-        except TypeError:
-            st.audio(corrente["wav"], format="audio/wav")
+        lettore_audio(corrente["wav"], velocita, corrente["play"])
         corrente["play"] = False
     elif st.session_state.get("errore_voce"):
         st.warning(
@@ -1075,6 +1107,10 @@ st.sidebar.selectbox(
     "🎙️ Tipo di voce", ["Naturale (Gemini)", "Del browser"], key="tipo_voce"
 )
 st.sidebar.selectbox("Voce naturale", VOCI_NATURALI, key="nome_voce")
+st.sidebar.slider(
+    "⚡ Velocità voce", min_value=0.8, max_value=1.6, value=1.15, step=0.05,
+    key="velocita_voce",
+)
 st.sidebar.checkbox("🔊 Voce automatica", value=False, key="voce_auto")
 
 if st.session_state.db_ok:
