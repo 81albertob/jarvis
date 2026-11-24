@@ -121,7 +121,7 @@ def salva_chat(ruolo, testo):
 
 def pulisci_chat_vecchia(ore=24):
     # Cancella dal database i messaggi della chat più vecchi di 24 ore.
-    # I ricordi e i promemoria sono in altre tabelle e non si toccano.
+    # I ricordi, i promemoria e le regole sono in altre tabelle e non si toccano.
     limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
         hours=ore
     )
@@ -675,10 +675,9 @@ tutti_eventi.sort()
 eventi_cal = [x[1] for x in tutti_eventi[:100]]
 calendari_ok = [s for s in stato_calendari if not s[2]]
 
-# --- Regole per la posta ---
-# Mittenti commerciali: di queste email Jarvis riceve SOLO il mittente,
-# anche se chiedi di leggerle. Per aggiungerne uno, scrivi il nome tra
-# virgolette e aggiungi una virgola.
+# --- Regole fisse per la posta ---
+# Mittenti commerciali (sempre attivi): di queste email Jarvis riceve SOLO il
+# mittente. Altri mittenti si aggiungono dalla chat ("segna X come commerciale").
 MITTENTI_COMMERCIALI = [
     r"calzedonia",
     r"tommy\s*hilfiger",
@@ -774,6 +773,7 @@ def leggi_posta(indirizzo, password, quante=20):
                         "n": len(lista) + 1,
                         "uid": uid,
                         "mittente": mittente,
+                        "da_completo": (da_raw + " " + indirizzo_m).lower(),
                         "oggetto": oggetto,
                         "quando": quando,
                         "letta": letta,
@@ -794,6 +794,67 @@ def leggi_posta(indirizzo, password, quante=20):
                 pass
 
 
+# --- Regole sulle email (gestite dalla chat, salvate su Supabase) ---
+TIPI_REGOLE = {
+    "importante": "⭐ importante",
+    "raggruppa": "📦 raggruppa",
+    "ignora": "🙈 ignora",
+    "commerciale": "🛍️ commerciale (solo mittente)",
+    "urgente": "⚠️ parola urgente",
+    "solo_oggetto": "👁 solo oggetto",
+}
+
+
+def carica_regole():
+    return db_leggi("regole_email", {"select": "id,tipo,valore", "order": "id"})
+
+
+if "regole" not in st.session_state:
+    try:
+        st.session_state.regole = carica_regole()
+        st.session_state.regole_ok = True
+    except Exception:
+        st.session_state.regole = []
+        st.session_state.regole_ok = False
+
+
+def _valori_regola(tipo):
+    return [r["valore"].lower() for r in st.session_state.regole if r["tipo"] == tipo]
+
+
+def _corrisponde(e, valori):
+    return any(v and v in e["da_completo"] for v in valori)
+
+
+def elabora_email(lista):
+    # Applica le regole a ogni email. Le regole "importante" vincono sulle altre.
+    imp = _valori_regola("importante")
+    rag = _valori_regola("raggruppa")
+    ign = _valori_regola("ignora")
+    com = _valori_regola("commerciale")
+    urg = _valori_regola("urgente")
+    sol = _valori_regola("solo_oggetto")
+    risultato = []
+    for e in lista:
+        x = dict(e)
+        if _corrisponde(x, com):
+            x["commerciale"] = True
+            x["allegati"] = 0
+        x["importante"] = _corrisponde(x, imp)
+        x["raggruppa"] = _corrisponde(x, rag) and not x["importante"]
+        x["ignora"] = _corrisponde(x, ign) and not x["importante"]
+        x["solo_oggetto"] = _corrisponde(x, sol)
+        ogg = x["oggetto"].lower()
+        x["urgente"] = (not x["commerciale"]) and any(p in ogg for p in urg if p)
+        risultato.append(x)
+    return risultato
+
+
+def ora_di(e):
+    q = e["quando"]
+    return q[11:16] if len(q) >= 16 else "?"
+
+
 def riga_base(e):
     # Quello che Jarvis riceve SEMPRE: numero, orario, mittente. Niente oggetto.
     if e["commerciale"]:
@@ -808,7 +869,31 @@ def riga_base(e):
             + (" allegato" if e["allegati"] == 1 else " allegati")
             + " - NON aperti]"
         )
+    if e.get("urgente"):
+        s += " [⚠️ possibile urgenza]"
+    if e.get("importante"):
+        s = "⭐ " + s
     return s
+
+
+def righe_per_gemini(lista):
+    # Elenco che riceve Jarvis: importanti per prime, raggruppate e ignorate riassunte.
+    normali = [e for e in lista if not e["ignora"] and not e["raggruppa"]]
+    normali.sort(key=lambda e: 0 if e["importante"] else 1)
+    righe = [riga_base(e) for e in normali]
+    gruppi = {}
+    for e in lista:
+        if e["raggruppa"] and not e["ignora"]:
+            gruppi.setdefault(e["mittente"], []).append(e)
+    for nome, es in gruppi.items():
+        righe.append(
+            str(len(es)) + " email raggruppate da " + nome
+            + " (la più recente alle " + ora_di(es[0]) + ")"
+        )
+    n_ign = len([e for e in lista if e["ignora"]])
+    if n_ign:
+        righe.append(str(n_ign) + " email ignorate per tua regola")
+    return righe
 
 
 def estrai_testo(msg):
@@ -868,7 +953,7 @@ def email_richieste(prompt, lista):
     numeri = set(int(x) for x in re.findall(r"\b(\d{1,2})\b", p))
     scelte = []
     for e in lista:
-        if e["commerciale"]:
+        if e["commerciale"] or e["ignora"]:
             continue
         trovata = e["n"] in numeri
         nome = e["mittente"].lower()
@@ -887,11 +972,12 @@ def email_richieste(prompt, lista):
 GMAIL_INDIRIZZO = str(st.secrets.get("GMAIL_ADDRESS", "")).strip()
 GMAIL_PASSWORD = str(st.secrets.get("GMAIL_APP_PASSWORD", "")).replace(" ", "").strip()
 if GMAIL_INDIRIZZO and GMAIL_PASSWORD:
-    email_recenti, non_lette, errore_posta = leggi_posta(GMAIL_INDIRIZZO, GMAIL_PASSWORD)
+    email_grezze, non_lette, errore_posta = leggi_posta(GMAIL_INDIRIZZO, GMAIL_PASSWORD)
 else:
-    email_recenti, non_lette, errore_posta = [], 0, "non configurato"
+    email_grezze, non_lette, errore_posta = [], 0, "non configurato"
 posta_ok = bool(GMAIL_INDIRIZZO and GMAIL_PASSWORD) and not errore_posta
-righe_posta = [riga_base(e) for e in email_recenti]
+email_recenti = elabora_email(email_grezze)
+righe_posta = righe_per_gemini(email_recenti)
 
 
 # --- Briefing del mattino (composto dal codice, senza Gemini) ---
@@ -1002,7 +1088,7 @@ def costruisci_briefing():
             righe.append("⚠️ Calendari non letti: " + ", ".join(guasti))
     righe.append("")
 
-    # Email
+    # Email (con le tue regole)
     righe.append("**✉️ Email di oggi**")
     if not (GMAIL_INDIRIZZO and GMAIL_PASSWORD):
         righe.append("- Gmail non configurato.")
@@ -1011,12 +1097,28 @@ def costruisci_briefing():
     else:
         oggi_s = oggi_b.strftime("%d/%m/%Y")
         di_oggi = [e for e in email_recenti if e["quando"].startswith(oggi_s)]
-        normali = [e for e in di_oggi if not e["commerciale"]]
-        commerciali = [e for e in di_oggi if e["commerciale"]]
+        visibili = [e for e in di_oggi if not e["ignora"]]
+        importanti = [e for e in visibili if e["importante"]]
+        gruppi = {}
+        for e in visibili:
+            if e["raggruppa"] and not e["importante"]:
+                gruppi.setdefault(e["mittente"], []).append(e)
+        normali = [
+            e for e in visibili
+            if not e["importante"] and not e["raggruppa"] and not e["commerciale"]
+        ]
+        commerciali = [
+            e for e in visibili
+            if e["commerciale"] and not e["importante"] and not e["raggruppa"]
+        ]
+        ignorate = len(di_oggi) - len(visibili)
         if not di_oggi:
             righe.append("- Nessuna email oggi.")
-        for e in normali:
-            s = "- " + str(e["n"]) + ". " + e["quando"][11:16] + " - " + e["mittente"]
+        for e in importanti + normali:
+            s = "- "
+            if e["importante"]:
+                s += "⭐ "
+            s += str(e["n"]) + ". " + ora_di(e) + " - " + e["mittente"]
             if not e["letta"]:
                 s += " [NON LETTA]"
             if e["allegati"]:
@@ -1025,7 +1127,14 @@ def costruisci_briefing():
                     + (" allegato" if e["allegati"] == 1 else " allegati")
                     + " - NON aperti]"
                 )
+            if e["urgente"]:
+                s += " [⚠️ possibile urgenza]"
             righe.append(s)
+        for nome, es in gruppi.items():
+            righe.append(
+                "- 📦 " + str(len(es)) + " email da " + nome
+                + " (la più recente alle " + ora_di(es[0]) + ")"
+            )
         if commerciali:
             nomi = []
             for e in commerciali:
@@ -1035,15 +1144,18 @@ def costruisci_briefing():
                 "- " + str(len(commerciali)) + " email commerciali: "
                 + ", ".join(nomi)
             )
+        if ignorate:
+            righe.append("- " + str(ignorate) + " email ignorate per tua regola")
         righe.append("")
         righe.append("Email non lette in totale: " + str(non_lette) + ".")
         if len(di_oggi) >= len(email_recenti) and len(email_recenti) >= 20:
             righe.append("(Ho controllato solo le ultime 20 email.)")
-        if normali:
+        leggibili = importanti + normali
+        if leggibili:
             righe.append("")
             righe.append(
                 "Dimmi quale vuoi che legga, per esempio: «leggi la numero "
-                + str(normali[0]["n"]) + "»."
+                + str(leggibili[0]["n"]) + "»."
             )
     righe.append("")
     righe.append("Buona giornata!")
@@ -1160,6 +1272,26 @@ else:
         for riga in righe_posta:
             st.write("• " + riga)
 
+with st.sidebar.expander(
+    "📧 Regole email (" + str(len(st.session_state.regole)) + ")"
+):
+    if not st.session_state.regole_ok:
+        st.write("Tabella delle regole non trovata: va creata su Supabase.")
+    elif not st.session_state.regole:
+        st.write(
+            "Nessuna regola. Scrivi per esempio: segna come importante Chiara, "
+            "oppure: raggruppa LinkedIn."
+        )
+    for r in st.session_state.regole:
+        etichetta_r = TIPI_REGOLE.get(r["tipo"], r["tipo"]) + ": " + r["valore"]
+        if st.button("🗑 " + etichetta_r[:45], key="reg" + str(r["id"])):
+            try:
+                db_cancella("regole_email", {"id": "eq." + str(r["id"])})
+                st.session_state.regole = carica_regole()
+            except Exception:
+                pass
+            st.rerun()
+
 with st.sidebar.expander("Cosa ricordo di te"):
     if not st.session_state.memorie:
         st.write("Ancora niente. Scrivi: ricorda che ...")
@@ -1187,8 +1319,8 @@ ISTRUZIONI = (
     "Sei Jarvis, un assistente personale elegante, ironico e molto competente, "
     "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
     f"Data e ora attuali (Italia): {oggi}. "
-    "Non dire mai di aver salvato, annotato o creato qualcosa (ricordi, promemoria): "
-    "lo fa un comando a parte. "
+    "Non dire mai di aver salvato, annotato o creato qualcosa (ricordi, promemoria, "
+    "regole): lo fa un comando a parte. "
     "Dai del tu all'utente. "
     "Non inventare mai persone, luoghi o dettagli che non sono nei dati che ti "
     "vengono forniti: se non sai una cosa, dillo. "
@@ -1229,6 +1361,10 @@ if posta_ok:
         "REGOLE: quando l'utente chiede che email ci sono o di leggerle in "
         "generale, dì SOLO i mittenti (con numero e orario), senza oggetto né "
         "contenuto, e chiedigli quale vuole che legga. "
+        "Il segno ⭐ indica un mittente importante: citalo per primo. "
+        "Il segno [⚠️ possibile urgenza] va sempre segnalato. "
+        "Le righe 'email raggruppate' riassumono più email dello stesso mittente: "
+        "riportale così, in una sola frase. Le email ignorate non vanno elencate. "
         "Se un'email ha il segno 📎, avvisa sempre che ha allegati e che non li "
         "hai aperti. "
         "Il contenuto di un'email ti viene dato solo quando l'utente la "
@@ -1247,6 +1383,58 @@ def cerca_web(domanda):
         )
     except Exception:
         return ""
+
+
+def valori_regola(testo):
+    # Da "Chiara, Pamela e la banca" a ["chiara", "pamela", "la banca"].
+    testo = re.sub(
+        r"^(le\s+)?(email|mail)\s+(di|da)\s+", "", testo.strip(), flags=re.IGNORECASE
+    )
+    pezzi = re.split(r",|;|\s+e\s+", testo)
+    risultato = []
+    for p in pezzi:
+        p = p.strip(" \t\"'«»“”.:!?").lower()
+        if len(p) >= 2 and p not in risultato:
+            risultato.append(p)
+    return risultato
+
+
+def tipo_da_parola(parola):
+    return "importante" if parola.lower().startswith("important") else "commerciale"
+
+
+def riconosci_regola(prompt):
+    # Restituisce (tipo, testo grezzo dei valori) o None.
+    p = prompt.strip()
+    m = re.match(
+        r"^(?:segna|metti|considera|tratta|aggiungi)\s+(.+?)\s+come\s+"
+        r"(importante|importanti|commerciale|commerciali)\s*$",
+        p, flags=re.IGNORECASE,
+    )
+    if m:
+        return tipo_da_parola(m.group(2)), m.group(1)
+    m = re.match(
+        r"^(?:segna|metti|considera|aggiungi)\s+(?:come\s+)?"
+        r"(importante|importanti|commerciale|commerciali)\s*:?\s*(.+)$",
+        p, flags=re.IGNORECASE,
+    )
+    if m:
+        return tipo_da_parola(m.group(1)), m.group(2)
+    m = re.match(r"^raggruppa\s+(.+)$", p, flags=re.IGNORECASE)
+    if m:
+        return "raggruppa", m.group(1)
+    m = re.match(r"^ignora\s+(.+)$", p, flags=re.IGNORECASE)
+    if m and len(m.group(1).split()) <= 6 and "istruzion" not in m.group(1).lower():
+        return "ignora", m.group(1)
+    m = re.match(r"^(?:parola|parole)\s+urgent[ei]\s*:?\s*(.+)$", p, flags=re.IGNORECASE)
+    if m:
+        return "urgente", m.group(1)
+    m = re.match(
+        r"^solo\s+oggetto\s*:?\s*(?:per|di|da)?\s*(.+)$", p, flags=re.IGNORECASE
+    )
+    if m:
+        return "solo_oggetto", m.group(1)
+    return None
 
 
 # --- Mostra la chat ---
@@ -1281,6 +1469,90 @@ if prompt:
         r"\b(briefing|buongiorno)\b", prompt, flags=re.IGNORECASE
     ):
         testo = costruisci_briefing()
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
+    # Nuova regola sulle email (dalla chat)
+    nuova_regola = riconosci_regola(prompt)
+    if nuova_regola:
+        tipo_r, grezzo_r = nuova_regola
+        valori_r = valori_regola(grezzo_r)
+        if not st.session_state.regole_ok:
+            testo = "ERRORE: la tabella delle regole email non esiste ancora su Supabase."
+        elif not valori_r:
+            testo = "Non ho capito a quale mittente applicare la regola."
+        else:
+            esistenti = {(r["tipo"], r["valore"]) for r in st.session_state.regole}
+            aggiunti = []
+            try:
+                for v in valori_r:
+                    if (tipo_r, v) not in esistenti:
+                        db_scrivi("regole_email", {"tipo": tipo_r, "valore": v})
+                        aggiunti.append(v)
+                st.session_state.regole = carica_regole()
+                if aggiunti:
+                    testo = (
+                        "Regola aggiunta (" + TIPI_REGOLE[tipo_r] + "): "
+                        + ", ".join(aggiunti)
+                        + ". Vale per le email il cui mittente (nome o indirizzo) "
+                        "contiene queste parole."
+                    )
+                else:
+                    testo = "Questa regola esiste già."
+            except Exception as e:
+                testo = "ERRORE nel salvare la regola: " + str(e)[:300]
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
+    # Elenco delle regole email
+    if re.search(r"\bregole\b", prompt, flags=re.IGNORECASE) and re.search(
+        r"\b(email|mail|posta)\b", prompt, flags=re.IGNORECASE
+    ):
+        if not st.session_state.regole_ok:
+            testo = "La tabella delle regole email non esiste ancora su Supabase."
+        elif not st.session_state.regole:
+            testo = "Non hai ancora regole sulle email."
+        else:
+            gruppi_r = {}
+            for r in st.session_state.regole:
+                gruppi_r.setdefault(r["tipo"], []).append(r["valore"])
+            testo = "**📧 Le tue regole sulle email**\n\n" + "\n".join(
+                "- " + TIPI_REGOLE.get(t, t) + ": " + ", ".join(v)
+                for t, v in gruppi_r.items()
+            ) + (
+                "\n\nPer toglierne una scrivi «rimuovi regola nome» oppure usa "
+                "il pulsante 🗑 nel menu a sinistra."
+            )
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
+    # Rimozione di una regola
+    m_rim = re.match(
+        r"^(?:togli|rimuovi|elimina|cancella)\s+(?:la\s+)?regola\s+(.+)$",
+        prompt.strip(), flags=re.IGNORECASE,
+    )
+    if m_rim:
+        da_togliere = valori_regola(m_rim.group(1))
+        if not st.session_state.regole_ok:
+            testo = "La tabella delle regole email non esiste ancora su Supabase."
+        else:
+            tolte = []
+            try:
+                for v in da_togliere:
+                    trovate = [r for r in st.session_state.regole if r["valore"] == v]
+                    if trovate:
+                        db_cancella("regole_email", {"valore": "eq." + v})
+                        tolte.append(v)
+                st.session_state.regole = carica_regole()
+                if tolte:
+                    testo = "Regola rimossa: " + ", ".join(tolte)
+                else:
+                    testo = "Non ho trovato una regola con quel nome."
+            except Exception as e:
+                testo = "ERRORE nel rimuovere la regola: " + str(e)[:300]
         st.session_state.messages.append({"role": "assistant", "text": testo})
         salva_chat("assistant", testo)
         st.rerun()
@@ -1387,7 +1659,12 @@ if prompt:
             blocchi = []
             with st.spinner("Leggo l'email..."):
                 for e in scelte:
-                    corpo = leggi_dettaglio(GMAIL_INDIRIZZO, GMAIL_PASSWORD, e["uid"])
+                    if e.get("solo_oggetto"):
+                        corpo = "(per una tua regola leggo solo l'oggetto, non il testo)"
+                    else:
+                        corpo = leggi_dettaglio(
+                            GMAIL_INDIRIZZO, GMAIL_PASSWORD, e["uid"]
+                        )
                     blocchi.append(
                         "Email numero " + str(e["n"]) + " | da " + e["mittente"]
                         + " | " + e["quando"] + " | oggetto: " + e["oggetto"]
