@@ -1,6 +1,7 @@
 import datetime
 import email
 import imaplib
+import json
 import re
 import time
 from email.header import decode_header, make_header
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from ddgs import DDGS
@@ -126,6 +128,62 @@ def pulisci_chat_vecchia(ore=24):
         )
     except Exception:
         pass
+
+
+# --- Voce: legge ad alta voce con la sintesi vocale del browser ---
+def pulsante_voce(testo, auto=False):
+    pulito = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", testo)
+    pulito = re.sub(r"https?://\S+", "", pulito)
+    pulito = re.sub(
+        r"[\U00010000-\U0010ffff\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]", "", pulito
+    )
+    pulito = re.sub(r"[*_`#>|]", "", pulito)
+    pulito = pulito.replace("°C", " gradi")
+    pulito = re.sub(r"\s+", " ", pulito).strip()[:1500]
+    if not pulito:
+        return
+    js_testo = json.dumps(pulito).replace("</", "<\\/")
+    html = """
+<style>
+body { margin: 0; background: transparent; font-family: monospace; }
+button {
+  background: #0b1626; color: #00d4ff; border: 1px solid #12405a;
+  border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  font-size: 14px; margin-right: 8px;
+}
+button:hover { border-color: #00d4ff; }
+</style>
+<button id="b">🔊 Leggi ad alta voce</button><button id="s">⏹ Stop</button>
+<script>
+const testo = __TESTO__;
+function parla() {
+  const sy = window.speechSynthesis;
+  if (!sy) { return; }
+  sy.cancel();
+  const voci = sy.getVoices();
+  const v = voci.find(function (x) {
+    return x.lang && x.lang.toLowerCase().startsWith("it");
+  });
+  const frasi = testo.split(/[.!?;]+\\s+/);
+  frasi.forEach(function (frase) {
+    if (!frase.trim()) { return; }
+    const u = new SpeechSynthesisUtterance(frase);
+    u.lang = "it-IT";
+    if (v) { u.voice = v; }
+    sy.speak(u);
+  });
+}
+document.getElementById("b").onclick = parla;
+document.getElementById("s").onclick = function () {
+  if (window.speechSynthesis) { window.speechSynthesis.cancel(); }
+};
+if (__AUTO__) { setTimeout(parla, 300); }
+</script>
+"""
+    html = html.replace("__TESTO__", js_testo).replace(
+        "__AUTO__", "true" if auto else "false"
+    )
+    components.html(html, height=48)
 
 
 # --- Promemoria ---
@@ -681,6 +739,7 @@ def costruisci_briefing():
                 if g["pioggia"] is not None:
                     s += ", probabilità di pioggia " + str(g["pioggia"]) + "%"
                 righe.append(s)
+        righe.append("")
         righe.append("Dati meteo: [Open-Meteo.com](https://open-meteo.com)")
     righe.append("")
 
@@ -841,6 +900,7 @@ if st.sidebar.button("☀️ Briefing del mattino"):
     st.rerun()
 
 usa_web = st.sidebar.checkbox("🔎 Ricerca online", value=True)
+st.sidebar.checkbox("🔊 Voce automatica", value=False, key="voce_auto")
 
 if st.session_state.db_ok:
     st.sidebar.success("🧠 Memoria collegata")
@@ -984,6 +1044,19 @@ for m in st.session_state.messages:
         st.markdown(m["text"])
 
 prompt = st.chat_input("Parla con Jarvis...")
+
+# Pulsante voce sotto l'ultima risposta
+if (
+    not prompt
+    and st.session_state.messages
+    and st.session_state.messages[-1]["role"] == "assistant"
+):
+    auto_voce = bool(
+        st.session_state.voce_auto
+        and st.session_state.get("voce_letto") != len(st.session_state.messages)
+    )
+    pulsante_voce(st.session_state.messages[-1]["text"], auto_voce)
+    st.session_state.voce_letto = len(st.session_state.messages)
 
 if prompt:
     st.session_state.messages.append({"role": "user", "text": prompt})
@@ -1160,6 +1233,8 @@ if prompt:
                 else:
                     testo = "Non ho ricevuto risposta."
         st.markdown(testo)
+        pulsante_voce(testo, st.session_state.voce_auto)
 
     st.session_state.messages.append({"role": "assistant", "text": testo})
     salva_chat("assistant", testo)
+    st.session_state.voce_letto = len(st.session_state.messages)
