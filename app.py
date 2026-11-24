@@ -206,56 +206,110 @@ VOCI_NATURALI = [
     "Charon", "Algieba", "Orus", "Iapetus", "Alnilam", "Umbriel",
     "Fenrir", "Puck", "Kore", "Zephyr",
 ]
-MODELLI_VOCE = [
-    "gemini-3.1-flash-tts-preview",
-    "gemini-3.8-flash-tts",
-    "gemini-2.5-flash-preview-tts",
-]
+URL_VOCE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+)
 STILE_JARVIS = (
     "Say in Italian, in a calm, refined, confident and slightly witty tone, "
     "like an elegant AI butler, with smooth and natural pacing: "
 )
+STILE_BREVE = (
+    "calm, refined, confident and slightly witty, like an elegant AI butler, "
+    "with smooth and natural pacing"
+)
 
 
-def pcm_a_wav(pcm):
+def pcm_a_wav(pcm, rate=24000):
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
-        w.setframerate(24000)
+        w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
 
 
+def _payload_classico(testo, voce):
+    return {
+        "contents": [{"parts": [{"text": STILE_JARVIS + testo}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voce}}
+            },
+        },
+    }
+
+
+def _payload_nuovo(testo, voce):
+    return {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": testo, "speech_metadata": {"style": STILE_BREVE}}
+                ],
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"voice": voce}},
+        },
+    }
+
+
+TENTATIVI_VOCE = [
+    ("gemini-3.1-flash-tts-preview", _payload_classico),
+    ("gemini-3.8-flash-tts", _payload_nuovo),
+    ("gemini-3.8-flash-tts", _payload_classico),
+    ("gemini-3.8-flash-lite-tts", _payload_nuovo),
+    ("gemini-2.5-flash-preview-tts", _payload_classico),
+]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def sintetizza(testo, voce):
-    # Voce naturale con Gemini. Se fallisce solleva un errore (non viene
-    # memorizzato), così puoi riprovare.
+    # Voce naturale: chiama direttamente il servizio di Gemini.
+    # Se fallisce solleva un errore (non viene memorizzato): puoi riprovare.
+    chiave_api = st.secrets["GEMINI_API_KEY"].strip()
     errori = []
-    for modello in MODELLI_VOCE:
+    for modello, costruisci in TENTATIVI_VOCE:
         try:
-            r = client.models.generate_content(
-                model=modello,
-                contents=STILE_JARVIS + testo,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voce
-                            )
-                        )
-                    ),
-                ),
+            r = requests.post(
+                URL_VOCE.format(modello),
+                headers={
+                    "x-goog-api-key": chiave_api,
+                    "Content-Type": "application/json",
+                },
+                json=costruisci(testo, voce),
+                timeout=90,
             )
-            dati = r.candidates[0].content.parts[0].inline_data.data
-            if isinstance(dati, str):
-                dati = base64.b64decode(dati)
-            if dati:
-                return pcm_a_wav(dati)
-            errori.append(modello + ": risposta vuota")
         except Exception as ex:
-            errori.append(modello + ": " + str(ex)[:150])
+            errori.append(modello + ": " + str(ex)[:100])
+            continue
+        if r.status_code == 429:
+            raise RuntimeError(
+                "limite di richieste raggiunto (429): aspetta un minuto e riprova"
+            )
+        if r.status_code != 200:
+            errori.append(
+                modello + ": " + str(r.status_code) + " "
+                + r.text[:150].replace("\n", " ")
+            )
+            continue
+        try:
+            dati_json = r.json()
+            for parte in dati_json["candidates"][0]["content"]["parts"]:
+                blob = parte.get("inlineData") or parte.get("inline_data")
+                if blob and blob.get("data"):
+                    pcm = base64.b64decode(blob["data"])
+                    tipo = blob.get("mimeType") or blob.get("mime_type") or ""
+                    m_rate = re.search(r"rate=(\d+)", tipo)
+                    rate = int(m_rate.group(1)) if m_rate else 24000
+                    return pcm_a_wav(pcm, rate)
+            errori.append(modello + ": nessun audio nella risposta")
+        except Exception as ex:
+            errori.append(modello + ": risposta non leggibile " + str(ex)[:80])
     raise RuntimeError(" | ".join(errori))
 
 
@@ -287,7 +341,7 @@ def mostra_voce(testo, auto):
                 st.session_state.errore_voce = ""
             except Exception as ex:
                 st.session_state.audio_corrente = None
-                st.session_state.errore_voce = str(ex)[:500]
+                st.session_state.errore_voce = str(ex)[:900]
     corrente = st.session_state.get("audio_corrente")
     if corrente and corrente["chiave"] == chiave:
         try:
@@ -1359,4 +1413,3 @@ if prompt:
     st.session_state.messages.append({"role": "assistant", "text": testo})
     salva_chat("assistant", testo)
     st.rerun()
-    
