@@ -390,6 +390,74 @@ def mostra_voce(testo, auto):
         )
 
 
+# --- Routine di Alexa (Voice Monkey) ---
+VM_URL = "https://api-v3.voicemonkey.io/trigger"
+VM_TOKEN = str(st.secrets.get("VOICEMONKEY_TOKEN", "")).strip()
+
+
+def trova_routine():
+    # Legge dai Secrets le righe VOICEMONKEY_nome = "id" (escluso VOICEMONKEY_TOKEN).
+    trovate = {}
+    for chiave in st.secrets:
+        k = str(chiave)
+        if k.upper().startswith("VOICEMONKEY_") and k.upper() != "VOICEMONKEY_TOKEN":
+            nome = k[len("VOICEMONKEY_"):].strip("_ ").lower().replace("_", " ")
+            valore = str(st.secrets[chiave]).strip()
+            if nome and valore:
+                trovate[nome] = valore
+    return trovate
+
+
+ROUTINE = trova_routine()
+
+
+def esegui_routine(nome):
+    # Invia la richiesta a Voice Monkey. Restituisce il testo da mostrare.
+    ora_t = time.time()
+    ultima = st.session_state.get("ultima_routine")
+    if ultima and ultima[0] == nome and ora_t - ultima[1] < 20:
+        return (
+            "Ho già inviato «" + nome + "» pochi secondi fa: non la rimando."
+        )
+    if not VM_TOKEN:
+        return "ERRORE: manca la riga VOICEMONKEY_TOKEN nei Secrets."
+    device = ROUTINE.get(nome)
+    if not device:
+        return "Non conosco la routine «" + nome + "»."
+    try:
+        r = requests.post(
+            VM_URL, json={"token": VM_TOKEN, "device": device}, timeout=15
+        )
+    except Exception as ex:
+        return (
+            "ERRORE: non riesco a contattare Voice Monkey ("
+            + str(ex)[:120].replace(VM_TOKEN, "[token]") + ")."
+        )
+    if r.status_code == 200:
+        st.session_state.ultima_routine = (nome, ora_t)
+        return (
+            "✅ Ho inviato ad Alexa la routine «" + nome + "». Non posso sapere "
+            "se si è avviata davvero: se non parte, controlla la routine "
+            "nell'app Alexa."
+        )
+    if r.status_code in (401, 403):
+        return (
+            "ERRORE: Voice Monkey non accetta il token (" + str(r.status_code)
+            + "). Controlla la riga VOICEMONKEY_TOKEN nei Secrets."
+        )
+    if r.status_code == 404:
+        return (
+            "ERRORE: Voice Monkey non trova il dispositivo di «" + nome
+            + "». Controlla l'ID nella riga VOICEMONKEY_ dei Secrets."
+        )
+    if r.status_code == 429:
+        return "Voice Monkey dice che hai fatto troppe richieste: riprova tra poco."
+    return (
+        "ERRORE da Voice Monkey (" + str(r.status_code) + "): "
+        + r.text[:150].replace("\n", " ").replace(VM_TOKEN, "[token]")
+    )
+
+
 # --- Promemoria ---
 def carica_promemoria():
     return db_leggi(
@@ -536,6 +604,123 @@ def leggi_meteo(citta):
         return luogo["name"], giorni, ""
     except Exception as ex:
         return citta, [], str(ex)[:150]
+
+
+def _num(x):
+    return str(round(x)) if isinstance(x, (int, float)) else "?"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def meteo_dettagliato(citta):
+    # Meteo completo per la chat: adesso, oggi, domani e le ore della giornata.
+    # Restituisce (nome città, testo, errore).
+    try:
+        g = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": citta, "count": 1, "language": "it"},
+            timeout=10,
+        ).json()
+        luogo = g["results"][0]
+        f = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": luogo["latitude"],
+                "longitude": luogo["longitude"],
+                "current": "temperature_2m,apparent_temperature,weather_code",
+                "hourly": "temperature_2m,precipitation_probability,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max",
+                "timezone": "auto",
+                "forecast_days": 2,
+            },
+            timeout=10,
+        ).json()
+        righe = []
+        cur = f.get("current") or {}
+        if cur:
+            righe.append(
+                "Adesso: " + CODICI_METEO.get(cur.get("weather_code"), "variabile")
+                + ", " + _num(cur.get("temperature_2m")) + "°C (percepiti "
+                + _num(cur.get("apparent_temperature")) + "°C)"
+            )
+        d = f["daily"]
+        nomi = ["Oggi", "Domani"]
+        for i in range(min(2, len(d["time"]))):
+            giorno_d = datetime.date.fromisoformat(d["time"][i])
+            righe.append(
+                nomi[i] + " (" + data_it(giorno_d) + "): "
+                + CODICI_METEO.get(d["weather_code"][i], "variabile")
+                + ", minima " + _num(d["temperature_2m_min"][i])
+                + "°C, massima " + _num(d["temperature_2m_max"][i])
+                + "°C, probabilità di pioggia massima "
+                + str(d["precipitation_probability_max"][i]) + "%"
+            )
+        h = f["hourly"]
+        fasce = [(0, [18, 20, 22]), (1, [9, 13, 18])]
+        for giorno_i, ore in fasce:
+            if giorno_i >= len(d["time"]):
+                continue
+            giorno_s = d["time"][giorno_i]
+            parti = []
+            for ora in ore:
+                chiave = giorno_s + "T" + str(ora).zfill(2) + ":00"
+                if chiave in h["time"]:
+                    k = h["time"].index(chiave)
+                    parti.append(
+                        "ore " + str(ora) + ": "
+                        + CODICI_METEO.get(h["weather_code"][k], "variabile")
+                        + ", " + _num(h["temperature_2m"][k]) + "°C, pioggia "
+                        + str(h["precipitation_probability"][k]) + "%"
+                    )
+            if parti:
+                titolo_f = (
+                    "Sera di oggi" if giorno_i == 0 else "Domani durante la giornata"
+                )
+                righe.append(titolo_f + " - " + "; ".join(parti))
+        return luogo["name"], "\n".join(righe), ""
+    except Exception as ex:
+        return citta, "", str(ex)[:150]
+
+
+STOP_CITTA = {
+    "oggi", "domani", "dopodomani", "stasera", "stanotte", "questa", "questo",
+    "quest", "notte", "sera", "mattina", "mattino", "pomeriggio", "casa", "me",
+    "te", "noi", "lui", "lei", "breve", "poco", "fine", "weekend", "settimana",
+    "ora", "adesso", "tutto", "tutta", "base", "caso", "proposito", "meteo",
+    "tempo", "previsioni", "previsione", "quanto", "che", "come", "cosa", "il",
+    "lo", "la", "le", "i", "gli", "un", "una", "uno", "del", "della", "dei",
+    "delle", "nel", "nella", "e", "o", "se", "ma", "mi", "ti", "ci", "si",
+    "piove", "pioggia", "freddo", "caldo", "neve", "vento", "sole",
+}
+
+
+def chiede_meteo(prompt):
+    return bool(
+        re.search(
+            r"\b(meteo|previsioni?|piove|piover\w*|pioggia|piogge|piovos\w*|"
+            r"ombrello|temperatur\w*|nevic\w*|neve|nuvol\w*|soleggiat\w*|"
+            r"che tempo|com'?è il tempo|come sarà il tempo|come sara il tempo|"
+            r"tempo (?:fa|farà|fara|che fa)|nebbia|vento|caldo|freddo)\b",
+            prompt, flags=re.IGNORECASE,
+        )
+    )
+
+
+def citta_dalla_frase(prompt):
+    # Cerca "a Roma", "di San Marino", "in Francia"... e restituisce la città.
+    for m in re.finditer(
+        r"\b(?:a|ad|in|di|per|su)\s+([A-Za-zÀ-ÿ'’\-]+(?:\s+[A-Za-zÀ-ÿ'’\-]+){0,2})",
+        prompt, flags=re.IGNORECASE,
+    ):
+        parole = []
+        for p in m.group(1).split():
+            if p.lower().strip("'’-") in STOP_CITTA:
+                break
+            parole.append(p)
+        candidato = " ".join(parole).strip()
+        if len(candidato) >= 3:
+            return candidato
+    return None
 
 
 # --- Calendari (sola lettura) ---
@@ -1231,6 +1416,27 @@ if st.session_state.db_ok:
 else:
     st.sidebar.error("Memoria NON collegata: " + st.session_state.db_errore)
 
+with st.sidebar.expander("🌙 Routine Alexa (" + str(len(ROUTINE)) + ")"):
+    if not ROUTINE:
+        st.write(
+            "Nessuna routine. Nei Secrets servono VOICEMONKEY_TOKEN e "
+            "VOICEMONKEY_nome = \"id\"."
+        )
+    else:
+        st.caption("Il pulsante ▶ invia subito la routine ad Alexa.")
+    for nome_rt in ROUTINE:
+        if st.button("▶ " + nome_rt, key="rt_" + nome_rt):
+            testo_rt = esegui_routine(nome_rt)
+            st.session_state.messages.append(
+                {"role": "user", "text": "Attiva " + nome_rt}
+            )
+            salva_chat("user", "Attiva " + nome_rt)
+            st.session_state.messages.append(
+                {"role": "assistant", "text": testo_rt}
+            )
+            salva_chat("assistant", testo_rt)
+            st.rerun()
+
 with st.sidebar.expander(
     "⏰ Promemoria (" + str(len(st.session_state.promemoria)) + ")"
 ):
@@ -1354,8 +1560,8 @@ ISTRUZIONI = (
     "come quello di Tony Stark. Rispondi sempre in italiano, in modo chiaro e conciso. "
     f"Data e ora attuali (Italia): {oggi}. "
     "Non dire mai di aver salvato, annotato, creato o applicato qualcosa (ricordi, "
-    "promemoria, regole, comandi): lo esegue il programma, non tu, e se un comando "
-    "non è stato eseguito non devi far finta che lo sia stato. "
+    "promemoria, regole, comandi, routine di Alexa): lo esegue il programma, non "
+    "tu, e se un comando non è stato eseguito non devi far finta che lo sia stato. "
     "Dai del tu all'utente. "
     "Non inventare mai persone, luoghi o dettagli che non sono nei dati che ti "
     "vengono forniti: se non sai una cosa, dillo. "
@@ -1364,6 +1570,27 @@ ISTRUZIONI = (
     "superate. "
     "Se ti vengono forniti risultati di ricerca web, usali e cita le fonti."
 )
+
+if ROUTINE:
+    ISTRUZIONI += (
+        "\n\nRoutine di Alexa che l'utente può attivare scrivendo «attiva "
+        "<nome>»: " + ", ".join(ROUTINE) + ". Le avvia il programma, non tu."
+    )
+
+# Meteo della città predefinita: sempre disponibile per Jarvis
+nome_rim, testo_rim, errore_rim = meteo_dettagliato(CITTA_METEO)
+if testo_rim:
+    ISTRUZIONI += (
+        "\n\nMeteo a " + nome_rim + " (città predefinita dell'utente), dati "
+        "aggiornati da Open-Meteo:\n" + testo_rim + "\n"
+        "Quando l'utente parla del tempo, di pioggia, temperature o ombrello "
+        "senza indicare una città, rispondi usando questi dati e parla di "
+        + nome_rim + ". Se cita un'altra città, nel suo messaggio trovi un "
+        "blocco 'Meteo a ...' con i dati di quella città: usa quelli. Non dire "
+        "mai di non avere accesso ai dati meteo. Chiudi le risposte sul meteo "
+        "con (dati: Open-Meteo.com)."
+    )
+
 if st.session_state.memorie:
     ISTRUZIONI += "\n\nCose che sai sull'utente (memoria permanente):\n" + "\n".join(
         "- " + m["testo"] for m in st.session_state.memorie
@@ -1561,6 +1788,61 @@ def riconosci_rimozione(prompt):
     return valori_regola(" ".join(parole[i + 1:]))
 
 
+# --- Routine di Alexa: riconoscimento dei comandi ---
+VERBI_ROUTINE = ["attiva", "avvia", "lancia", "esegui", "attivami", "avviami"]
+PAROLE_VUOTE_ROUTINE = {
+    "la", "il", "lo", "l", "routine", "di", "alexa", "per", "favore", "jarvis",
+    "ora", "adesso", "una", "per favore",
+}
+
+
+def nome_routine_da_testo(testo):
+    parole = re.findall(r"[a-zà-ú0-9]+", testo.lower())
+    pulito = " ".join(p for p in parole if p not in PAROLE_VUOTE_ROUTINE)
+    if not pulito:
+        return None
+    if pulito in ROUTINE:
+        return pulito
+    trovati = difflib.get_close_matches(pulito, list(ROUTINE), n=1, cutoff=0.78)
+    return trovati[0] if trovati else None
+
+
+def riconosci_routine(prompt):
+    # Restituisce ("avvia", nome), ("elenco",), ("sconosciuta",) oppure None.
+    if not ROUTINE:
+        return None
+    p = prompt.strip()
+    parole = p.split()
+    if not parole:
+        return None
+    basso = p.lower()
+    if re.search(r"\brout[iì]ne\b", basso) and re.search(
+        r"\b(quali|elenco|lista|disponibili|posso)\b", basso
+    ):
+        return ("elenco",)
+    verbo_ok = False
+    resto = ""
+    if basso.startswith("fai partire"):
+        verbo_ok = True
+        resto = p[len("fai partire"):]
+    elif vicino(parole[0], VERBI_ROUTINE, 0.85):
+        verbo_ok = True
+        resto = p[len(parole[0]):]
+    if verbo_ok:
+        if len(parole) > 8:
+            return None
+        nome = nome_routine_da_testo(resto)
+        if nome:
+            return ("avvia", nome)
+        return ("sconosciuta",) if resto.strip() else None
+    # Messaggio formato solo dal nome della routine ("buonanotte")
+    if len(parole) <= 3:
+        nome = nome_routine_da_testo(p)
+        if nome:
+            return ("avvia", nome)
+    return None
+
+
 # --- Mostra la chat ---
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -1592,6 +1874,26 @@ if prompt:
     # Briefing del mattino: "buongiorno" o "briefing" (frasi corte)
     if e_briefing(prompt):
         testo = costruisci_briefing()
+        st.session_state.messages.append({"role": "assistant", "text": testo})
+        salva_chat("assistant", testo)
+        st.rerun()
+
+    # Routine di Alexa (Voice Monkey)
+    esito_routine = riconosci_routine(prompt)
+    if esito_routine:
+        if esito_routine[0] == "elenco":
+            testo = (
+                "**🌙 Routine che posso attivare**\n\n"
+                + "\n".join("- " + n for n in ROUTINE)
+                + "\n\nScrivi per esempio «attiva " + list(ROUTINE)[0] + "»."
+            )
+        elif esito_routine[0] == "avvia":
+            testo = esegui_routine(esito_routine[1])
+        else:
+            testo = (
+                "Non conosco questa routine. Quelle disponibili sono: "
+                + ", ".join(ROUTINE) + "."
+            )
         st.session_state.messages.append({"role": "assistant", "text": testo})
         salva_chat("assistant", testo)
         st.rerun()
@@ -1764,20 +2066,39 @@ if prompt:
         salva_chat("assistant", testo)
         st.rerun()
 
-    # Ricerca web (non serve per domande su calendario, posta o promemoria)
+    # Ricerca web (non serve per calendario, posta, promemoria e meteo)
     parole_interne = (
         "appuntament", "calendario", "agenda", "impegn", "mail", "posta",
         "messaggi", "promemoria",
     )
     parla_di_cose_tue = any(p in prompt.lower() for p in parole_interne)
+    meteo_chiesto = chiede_meteo(prompt)
     testo_per_ai = prompt
-    if usa_web and not parla_di_cose_tue:
+    if usa_web and not parla_di_cose_tue and not meteo_chiesto:
         with st.spinner("Cerco online..."):
             info = cerca_web(prompt)
         if info:
             testo_per_ai = (
                 prompt + "\n\n[Risultati di ricerca web aggiornati]\n" + info
             )
+
+    # Meteo di un'altra città, se la nomini (altrimenti vale quello di Rimini)
+    if meteo_chiesto:
+        citta_q = citta_dalla_frase(prompt)
+        if citta_q and citta_q.lower() != CITTA_METEO.lower():
+            with st.spinner("Leggo il meteo..."):
+                nome_q, testo_q, errore_q = meteo_dettagliato(citta_q)
+            if testo_q:
+                testo_per_ai += (
+                    "\n\n[Meteo a " + nome_q + " - Open-Meteo, dati aggiornati]\n"
+                    + testo_q
+                )
+            else:
+                testo_per_ai += (
+                    "\n\n[Non sono riuscito a leggere il meteo di " + citta_q
+                    + ": dillo all'utente e non usare i dati di un'altra città "
+                    "come se fossero i suoi]"
+                )
 
     # Lettura di email precise: solo se le chiedi tu (per numero o per mittente)
     if posta_ok:
